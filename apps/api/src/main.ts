@@ -6,10 +6,14 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger'
 
 import { AppModule } from './app.module'
+import { validateEnv } from './config/env'
 
 const logger = new Logger('Bootstrap')
 
 async function bootstrap(): Promise<void> {
+  // Fail fast if env is invalid — app refuses to start
+  const env = validateEnv()
+
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({ logger: false }),
@@ -27,11 +31,11 @@ async function bootstrap(): Promise<void> {
   )
 
   app.enableCors({
-    origin: process.env['FRONTEND_URL'] ?? 'http://localhost:3000',
+    origin: env.FRONTEND_URL ?? (env.NODE_ENV === 'production' ? undefined : 'http://localhost:3000'),
     credentials: true,
   })
 
-  if (process.env['NODE_ENV'] !== 'production') {
+  if (env.NODE_ENV !== 'production') {
     const config = new DocumentBuilder()
       .setTitle('DataScriba API')
       .setDescription('Your AI-powered data scribe — REST API')
@@ -44,12 +48,9 @@ async function bootstrap(): Promise<void> {
     logger.log('Swagger UI available at /api/docs')
   }
 
-  const port = process.env['API_PORT'] ? parseInt(process.env['API_PORT'], 10) : 3001
-  const host = process.env['API_HOST'] ?? '0.0.0.0'
-
-  await app.listen(port, host)
-  logger.log(`DataScriba API running on http://${host}:${port}`)
-  logger.log(`Environment: ${process.env['NODE_ENV'] ?? 'development'}`)
+  await app.listen(env.API_PORT, env.API_HOST)
+  logger.log(`DataScriba API running on http://${env.API_HOST}:${env.API_PORT}`)
+  logger.log(`Environment: ${env.NODE_ENV}`)
 }
 
 void bootstrap()

@@ -1,14 +1,16 @@
-# REVIEW.md — Phase 1: Turborepo Monorepo + NestJS API Skeleton
+# REVIEW.md — Phase 2: Veri Kaynağı Yönetimi (MSSQL)
 
 **Reviewer:** reviewer agent
-**Date:** 2026-05-12
+**Date:** 2026-05-13
 **Verdict:** APPROVED_WITH_CHANGES
 
 ---
 
 ## Executive Summary
 
-The Phase 1 implementation is of high quality overall — the monorepo scaffold is clean, NestJS patterns are correctly applied, and the code is free of `any`, `console.log`, `var`, and hardcoded secrets. Two issues require fixing before the tester proceeds: the `HealthResponse` interface is duplicated between `app.controller.ts` and `app.service.ts` instead of being declared once in a shared location, and the `apps/api/.eslintrc.js` adds an undocumented rule override (`'@typescript-eslint/dot-notation': 'off'`) that was not in the TASK_PLAN and silences a useful safety check without explanation. All four builder deviations from the plan are justified and correctly implemented.
+Phase 2 delivers a solid, well-structured MSSQL data source management implementation. The crypto layer (AES-256-GCM), query guard, NestJS module wiring, and overall TypeScript hygiene are all high quality. No `any`, no `console.log`, no `var`, no `==` — CLAUDE.md basics are clean throughout all reviewed files.
+
+Three issues require fixing before commit: (1) query timeout is checked *after* the query completes rather than enforced as a hard deadline, (2) the `executeQuery` endpoint accepts a raw inline `{ sql, params }` body with no typed DTO or class-validator decorators — `ValidationPipe` does not validate inline types, (3) `DataSourceService.getDriver` is missing its explicit return type annotation. Five warnings should be addressed soon, including `vi.stubEnv` leaking between test files, SQL being logged verbatim on execute errors, and the service reading `process.env` directly instead of the validated `env` module.
 
 ---
 
@@ -16,192 +18,284 @@ The Phase 1 implementation is of high quality overall — the monorepo scaffold 
 
 | Dimension | Status | Notes |
 |-----------|--------|-------|
-| TypeScript strictness | ✅ PASS | No `any`, explicit return types on all exports, `interface` used for object shapes, strict mode on |
-| Security | ✅ PASS | No hardcoded secrets, no `console.log`, env access uses `process.env['KEY']` throughout, CORS uses env var with safe fallback |
-| NestJS patterns | ✅ PASS | Module/controller/service DI is correct, global prefix with health exclude correct, Swagger gated to non-production |
-| Test quality | ⚠️ WARNING | Unit tests are meaningful (3 distinct assertions), e2e uses real Fastify adapter correctly; minor: e2e does not assert timestamp format validity |
-| Monorepo config | ✅ PASS | pnpm workspace correct, turbo.json pipeline correct and complete, shared packages use `workspace:*`, tsconfig inheritance chain is sound |
-| Code style | ✅ PASS | No semis, single quotes, trailing commas, 100-char width — matches `.prettierrc` exactly; kebab-case files, PascalCase classes, no prefix `I`/`T` |
-| CLAUDE.md compliance | ⚠️ WARNING | No violations of hard rules (`any`, `var`, `==`, `console.log`); however `HealthResponse` interface is defined twice (controller + service) instead of once — violates DRY and the single-declaration intent of `interface` for object shapes |
-| TASK_PLAN.md deviations | ✅ PASS | All 4 deviations are justified and correctly implemented (see section below) |
+| TypeScript strictness | ⚠️ WARNING | One missing explicit return type on `getDriver`; `unknown[]` params typing is intentionally loose but acceptable |
+| Security | ⚠️ WARNING | Timeout is post-hoc only; SQL logged verbatim on execute error; `executeQuery` body is untyped; EXEC/xp_ not blocked |
+| NestJS patterns | ✅ PASS | Module wiring correct, APP_FILTER global via token, ValidationPipe strict, Swagger disabled in production |
+| Error handling | ✅ PASS | All paths caught and mapped, no swallowed errors, stack traces not exposed in HTTP responses |
+| Test quality | ⚠️ WARNING | `vi.stubEnv` not restored; no test for `update` re-encryption; query-guard has no test verifying INSERT/UPDATE are allowed |
+| Crypto implementation | ✅ PASS | IV fresh per call, authTag verified, key length validated (32 bytes), hex encoding correct |
+| CLAUDE.md compliance | ✅ PASS | No `any`, no `console.log`, no `var`, no `==`, named exports used, process.stdout/stderr in logger (not console) |
+| Builder deviations | ✅ PASS | All 5 deviations are justified (see section below) |
 
 ---
 
 ## Issues Found
 
-### 🔴 Critical (must fix before next phase)
+### Critical (must fix before commit)
 
-**1. `HealthResponse` interface duplicated across two files**
+**C-1 — Query timeout is post-hoc only — does not actually limit execution time**
+File: `packages/db-drivers/src/drivers/mssql.driver.ts`, lines 115–119
 
-- `apps/api/src/app.controller.ts` lines 6-10
-- `apps/api/src/app.service.ts` lines 3-7
-
-Both files define an identical `interface HealthResponse`. This is not a compile error today, but it is a maintenance trap: when a field is added to the health response (e.g., `uptime`, `env`) it must be updated in two places and can silently diverge. The correct pattern for a NestJS skeleton is to either:
-
-- Move `HealthResponse` to a `dto/health-response.dto.ts` file and import it in both files, or
-- Export it from `app.service.ts` and import it in `app.controller.ts`.
-
-Since Phase 1 has no `dto/` directory yet, exporting from `app.service.ts` is the minimal-change fix.
-
-**Fix:**
 ```ts
-// apps/api/src/app.service.ts — add `export`
-export interface HealthResponse {
-  status: 'ok'
-  timestamp: string
-  version: string
+const start = Date.now()
+const result = await request.query(sql)   // ← runs to full completion regardless
+const durationMs = Date.now() - start
+if (durationMs > this.queryTimeoutMs) throw new QueryTimeoutError(sql, this.queryTimeoutMs)
+```
+
+The query runs to completion before the timeout is evaluated. A 60-second query against a `queryTimeoutMs: 5000` driver will block for the full 60 seconds. The mssql `Request` object exposes a `timeout` property that sets the SQL Server request timeout at the TDS protocol level. Fix:
+
+```ts
+const request = pool.request()
+request.timeout = this.queryTimeoutMs   // enforce at protocol level
+params.forEach((p, i) => { request.input(`p${i + 1}`, p) })
+const start = Date.now()
+const result = await request.query(sql)
+const durationMs = Date.now() - start
+```
+
+The post-hoc `durationMs` check can remain for metrics, but the hard limit must be enforced before the query is sent.
+
+---
+
+**C-2 — `executeQuery` endpoint has no typed DTO — `ValidationPipe` silently passes invalid input**
+File: `apps/api/src/modules/data-source/data-source.controller.ts`, lines 103–106
+
+```ts
+@Post(':id/execute')
+async executeQuery(
+  @Param('id') id: string,
+  @Body() body: { sql: string; params?: unknown[] },
+): Promise<QueryResult> {
+```
+
+The body is an inline TypeScript type literal. NestJS `ValidationPipe` (with `whitelist: true` and `forbidNonWhitelisted: true`) operates on class instances and their decorator metadata — it does not validate plain interface/object types. A request body of `{}` (missing `sql`) reaches `DataSourceService.executeQuery(id, undefined, [])` and causes a runtime crash rather than a clean `400 Bad Request`.
+
+Fix: create `apps/api/src/modules/data-source/dto/execute-query.dto.ts`:
+
+```ts
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger'
+import { IsArray, IsOptional, IsString, MinLength } from 'class-validator'
+
+export class ExecuteQueryDto {
+  @ApiProperty({ description: 'SQL query to execute', example: 'SELECT TOP 10 * FROM dbo.Orders' })
+  @IsString()
+  @MinLength(1)
+  sql!: string
+
+  @ApiPropertyOptional({ description: 'Query parameters', type: [Object] })
+  @IsOptional()
+  @IsArray()
+  params?: unknown[]
 }
 ```
+
+Then use `@Body() dto: ExecuteQueryDto` in the controller.
+
+---
+
+**C-3 — `DataSourceService.getDriver` missing explicit return type (CLAUDE.md violation)**
+File: `apps/api/src/modules/data-source/data-source.service.ts`, line 119
+
 ```ts
-// apps/api/src/app.controller.ts — remove local interface, import instead
-import type { HealthResponse } from './app.service'
+private getDriver(record: DataSourceRecord) {
+```
+
+CLAUDE.md mandates explicit return types on exported functions. By convention the same applies to private methods on injectable services since they participate in the public interface indirectly. Add the return type:
+
+```ts
+private getDriver(record: DataSourceRecord): DataSourceDriver {
 ```
 
 ---
 
-**2. Undocumented ESLint rule override in `apps/api/.eslintrc.js`**
+### Warnings (should fix soon)
 
-- `apps/api/.eslintrc.js` line 12: `'@typescript-eslint/dot-notation': 'off'`
+**W-1 — SQL string logged verbatim on execute errors — potential data exposure**
+File: `packages/db-drivers/src/drivers/mssql.driver.ts`, line 140
 
-This rule was not in the TASK_PLAN (Step 16) and is not present in either the shared `nestjs.js` or the root `.eslintrc.js`. Disabling `dot-notation` suppresses the rule that enforces `obj['key']` vs `obj.key` consistency. Given that CLAUDE.md mandates `process.env['KEY']` (bracket notation for env access), disabling this rule could allow `process.env.KEY` to slip through in future code without a lint error. The override needs either:
-
-- A comment explaining why it is needed for NestJS (e.g., if Reflect.metadata access causes false positives), or
-- Removal if there is no NestJS-specific reason.
-
-**Fix:** Remove line 12 (`'@typescript-eslint/dot-notation': 'off'`) unless there is a documented reason it is needed for NestJS decorator patterns.
-
----
-
-### 🟡 Warning (should fix soon)
-
-**3. `apps/api/tsconfig.build.json` is redundant with `tsconfig.json`**
-
-- `apps/api/tsconfig.build.json` (all 4 lines)
-
-The file extends `./tsconfig.json` and repeats the same `exclude` list that is already in `tsconfig.json`. This adds no value — `tsconfig.build.json` and `tsconfig.json` are identical in effect. The `nest-cli.json` points to `tsconfig.build.json`, which is conventional, but the file should at minimum differ from `tsconfig.json` (e.g., by removing source maps or declarations for the production build). This is a low-risk issue now but becomes confusing once the project grows.
-
-**Suggested fix:** Either add production-optimised flags (`"sourceMap": false, "declaration": false`) to `tsconfig.build.json`, or consolidate and have `nest-cli.json` point directly to `tsconfig.json`.
-
----
-
-**4. E2E test does not validate timestamp format**
-
-- `apps/api/test/app.e2e-spec.ts` line 47: `expect(typeof response.body.timestamp).toBe('string')`
-
-The unit test correctly validates the timestamp is a valid ISO string (`new Date(result.timestamp).toISOString() === result.timestamp`), but the e2e test only checks that `timestamp` is a string. A non-ISO string would pass. This is a weak assertion for an HTTP-level test.
-
-**Suggested fix:**
 ```ts
-expect(new Date(response.body.timestamp as string).toISOString()).toBe(response.body.timestamp)
+logger.error({ err, sql }, 'MSSQL execute failed')
+```
+
+User-supplied SQL appears in structured logs at the `err` level. Even though parameterized queries prevent injection, the SQL text itself may contain schema names, column names, or business logic that should not appear in log aggregation systems shipped to third-party observability services. Consider logging only the first 200 characters (`sql.slice(0, 200)`) or a hash of the SQL, and relying on the `QueryError` object's `.sql` field for internal debugging only.
+
+---
+
+**W-2 — `vi.stubEnv` is not restored between test files**
+File: `apps/api/src/modules/data-source/data-source.service.spec.ts`, line 19
+
+```ts
+vi.stubEnv('ENCRYPTION_MASTER_KEY', TEST_KEY)
+```
+
+Without a corresponding `afterEach(() => vi.unstubAllEnvs())`, the environment stub persists across test modules when Vitest runs with `--pool=threads` (the default). This causes non-deterministic test failures in other spec files that depend on `process.env`. Add:
+
+```ts
+afterEach(() => {
+  vi.unstubAllEnvs()
+})
 ```
 
 ---
 
-**5. `version` is hardcoded as `'0.1.0'` in `AppService`**
+**W-3 — No test for `update` with a new connection string (re-encryption path)**
+File: `apps/api/src/modules/data-source/data-source.service.spec.ts`
 
-- `apps/api/src/app.service.ts` line 14
+The `update` describe block (lines 96–112) only tests name changes. There is no test verifying that passing a new `connectionString` to `update` results in re-encryption in the repository. This is the same encrypt/decrypt lifecycle pattern covered by the `create` test (line 42) and should be mirrored:
 
-The version string is not read from `package.json` or an environment variable — it is a literal. When the package version changes, the health endpoint will silently return a stale value. This is acceptable for a skeleton but should be noted as technical debt before Phase 2.
-
-**Suggested fix (Phase 2):** Read from `process.env['npm_package_version']` or use a build-time constant injected via `@nestjs/config`.
-
----
-
-**6. `shared-types` package not referenced by `apps/api`**
-
-- `apps/api/package.json` has no dependency on `@datascriba/shared-types`
-
-The `packages/shared-types` package defines `ApiResponse<T>` and `PaginatedResponse<T>` that the API will need in Phase 2. The package is not wired as a dependency of `@datascriba/api`. This is not a bug in Phase 1 (the skeleton does not use these types yet), but it should be added before Phase 2 feature work begins to avoid a disruptive package.json change mid-phase.
-
-**Suggested fix:** Add `"@datascriba/shared-types": "workspace:*"` to `apps/api/package.json` dependencies before Phase 2 starts.
+```ts
+it('re-encrypts the connection string on update', async () => {
+  const created = await service.create({ name: 'DB', type: 'mssql', connectionString: 'Server=old;' })
+  await service.update(created.id, { connectionString: 'Server=new;' })
+  const stored = (await repository.findAll('default'))[0]
+  expect(stored?.encryptedConnectionString).toMatch(/^[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/)
+  expect(stored?.encryptedConnectionString).not.toContain('Server=new')
+})
+```
 
 ---
 
-### 🟢 Suggestions (optional improvements)
+**W-4 — MSSQL-specific dangerous constructs not blocked by query guard**
+File: `packages/db-drivers/src/query-guard.ts`
 
-**S1. `vitest.e2e.config.ts` has no coverage config**
+`BLOCKED_PATTERNS` covers `DROP`, `TRUNCATE`, and `DELETE FROM`. MSSQL-specific attack vectors are absent:
+- `EXEC xp_cmdshell(...)` — executes OS commands
+- `EXEC sp_configure` — alters server settings
+- `OPENROWSET` / `OPENQUERY` — lateral movement to remote servers
 
-Unlike the unit config, the e2e config does not define a `coverage` block. This is intentional for e2e runs but worth noting: if someone runs `vitest run --coverage --config vitest.e2e.config.ts` the output may be unexpected.
+At minimum add:
 
-**S2. `CORS` allows `http://localhost:3000` as fallback in all environments**
+```ts
+/\bEXEC\s+xp_/i,
+/\bEXEC\s+sp_configure\b/i,
+/\bOPENROWSET\b/i,
+/\bOPENQUERY\b/i,
+```
 
-`apps/api/src/main.ts` line 30-33: in production with `FRONTEND_URL` unset, CORS would allow `localhost:3000`. A safer pattern is to make CORS origin `undefined` (no CORS) when `NODE_ENV === 'production'` and `FRONTEND_URL` is unset.
+This is a defense-in-depth concern — parameterized queries already prevent injection — but the guard's purpose is to provide an additional safety layer for the reporting context.
 
-**S3. `@nestjs/swagger` Swagger plugin `controllerKeyOfTags: false` is a non-standard option**
+---
 
-`nest-cli.json` line 14: `controllerKeyOfTags` is not a documented option for the `@nestjs/swagger` CLI plugin (documented options are `introspectComments`, `classValidatorShim`, `dtoFileNameSuffix`, `dtoKeyOfComment`, `controllerFileNameSuffix`). It will be silently ignored. Remove it to keep the config clean.
+**W-5 — `DataSourceService.getMasterKey` reads `process.env` directly, bypassing the validated `env` module**
+File: `apps/api/src/modules/data-source/data-source.service.ts`, lines 26–29
 
-**S4. `packages/shared-types` `main` points to a `.ts` source file**
+```ts
+private getMasterKey(): string {
+  const key = process.env['ENCRYPTION_MASTER_KEY']
+  if (!key) throw new Error('ENCRYPTION_MASTER_KEY is not set')
+  return key
+}
+```
 
-`packages/shared-types/package.json` lines 5-6: `"main": "./src/index.ts"` and `"types": "./src/index.ts"` — pointing `main` to a `.ts` file works in a monorepo with TypeScript resolution but is non-standard and will break if the package is ever published or consumed by a non-TS tool.
+`apps/api/src/config/env.ts` exports a Zod-validated `env` object that guarantees `ENCRYPTION_MASTER_KEY` is a valid 64-character hex string before the app starts. The service re-implements the "is it set?" guard and misses the hex-format validation. The correct pattern:
+
+```ts
+import { env } from '../../config/env'
+// ...
+private getMasterKey(): string {
+  return env.ENCRYPTION_MASTER_KEY
+}
+```
+
+This eliminates duplicated validation logic and ensures `getMasterKey()` can never return an invalid key that passes the empty-string check but fails the `Buffer.from(key, 'hex').length !== 32` check inside `crypto.ts`.
+
+---
+
+### Suggestions (optional)
+
+**S-1 — `SchemaCache` is untyped — forces callers to cast**
+File: `packages/db-drivers/src/schema-cache.ts`, line 20 / `apps/api/src/modules/data-source/data-source.service.ts`, line 92
+
+`get(key: string): unknown | null` forces the caller to write `cached as TableMeta[]`. Consider making `SchemaCache` generic:
+
+```ts
+export class SchemaCache<T> {
+  get(key: string): T | null { ... }
+  set(key: string, value: T, ttlMs?: number): void { ... }
+}
+```
+
+Usage: `private readonly schemaCache = new SchemaCache<TableMeta[]>()`. Eliminates unsafe casts.
+
+---
+
+**S-2 — `POST /data-sources` returns `200 OK` instead of `201 Created`**
+File: `apps/api/src/modules/data-source/data-source.controller.ts`, lines 32–36
+
+REST convention for resource creation is `201 Created`. Add `@HttpCode(HttpStatus.CREATED)` to the `create` handler and add an `@ApiCreatedResponse` decorator to make Swagger accurate.
+
+---
+
+**S-3 — `createLogger` uses `process.stdout.write` — should be replaced with injected Pino in Phase 3**
+File: `packages/db-drivers/src/logger.ts`, lines 17–24
+
+Not a CLAUDE.md violation (no `console.log`), and keeping `db-drivers` dependency-free is a reasonable design choice. However, the custom logger does not support log level filtering, sampling, or redaction. In Phase 3 when `nestjs-pino` is integrated at the API layer, `MssqlDriver` should accept an optional `Logger` via its constructor so the NestJS Pino instance is propagated down. Track as a Phase 3 TODO.
+
+---
+
+**S-4 — `require('mssql')` workaround lacks an ADR**
+File: `packages/db-drivers/src/drivers/mssql.driver.ts`, lines 9–10
+
+```ts
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const mssql = require('mssql') as typeof import('mssql')
+```
+
+The comment explains the CJS/ESM issue. This decision should be recorded in `docs/adr/` so future contributors do not attempt to convert this to an `import` statement (which breaks at runtime).
+
+---
+
+**S-5 — Docker Compose has no MSSQL service for local development**
+File: `docker/docker-compose.yml`
+
+Phase 2 adds MSSQL driver support, but the compose file includes only PostgreSQL and Redis. Integration testing against a live MSSQL instance requires a separate setup. Consider adding an `mssql` service (`mcr.microsoft.com/mssql/server:2022-latest`) behind a Docker Compose profile so it is opt-in:
+
+```yaml
+mssql:
+  image: mcr.microsoft.com/mssql/server:2022-latest
+  profiles: [mssql]
+  environment:
+    SA_PASSWORD: "YourStrong!Passw0rd"
+    ACCEPT_EULA: "Y"
+  ports:
+    - '1433:1433'
+```
 
 ---
 
 ## Builder Deviations — Justified?
 
-### Deviation 1: Added `root: true` to `apps/api/.eslintrc.js`
-
-**Was it necessary?** Yes. Without `root: true`, ESLint walks up the directory tree and merges the root `.eslintrc.js` config into the API's config. The root config enables `plugin:@typescript-eslint/recommended-type-checked` with `project: ['./tsconfig.base.json', './apps/*/tsconfig.json', ...]` which conflicts with the API's own project reference. Adding `root: true` stops the walk and gives the API package a clean, self-contained config.
-
-**Correctly implemented?** Yes — placed at line 4, before `extends`.
-
-**Any risk?** None. This is the standard Turborepo pattern.
-
----
-
-### Deviation 2: Added `tsconfig.eslint.json` to `apps/api/`
-
-**Was it necessary?** Yes. The TASK_PLAN pointed `parserOptions.project` to `./tsconfig.json`, but `tsconfig.json` excludes `test/**` and `**/*spec.ts`. ESLint needs to parse those files for type-checked rules. `tsconfig.eslint.json` extends `tsconfig.json` and adds `test/**/*` to `include` without affecting the build output.
-
-**Correctly implemented?** Yes — `tsconfig.eslint.json` extends `./tsconfig.json`, adds `test/**/*` to `include`, removes spec patterns from `exclude`. The `.eslintrc.js` references `./tsconfig.eslint.json` correctly via `parserOptions.project`.
-
-**Any risk?** Minimal. The pattern is well-established in the NestJS + typescript-eslint ecosystem.
-
----
-
-### Deviation 3: Added `unplugin-swc` and `@swc/core` to Vitest configs
-
-**Was it necessary?** Yes. Vitest's default transformer (esbuild) does not emit TypeScript decorator metadata (`emitDecoratorMetadata`), which NestJS's DI system requires at runtime. Without SWC as the transformer, `@nestjs/testing` `Test.createTestingModule()` fails because providers are not resolved. The TASK_PLAN used plain `defineConfig` without a plugin — the builder discovered this limitation and correctly fixed it.
-
-**Correctly implemented?** Yes — `unplugin-swc` is used as a Vite plugin in both `vitest.config.ts` and `vitest.e2e.config.ts` with `decoratorMetadata: true` and `legacyDecorator: true`. SWC target is set to `es2022`, matching the TypeScript config.
-
-**Any risk?** Low. SWC is a well-maintained project (Vercel-backed). The only risk is an SWC/NestJS version mismatch in future — pinning `@swc/core` to a minor range (`^1.x`) mitigates this.
-
----
-
-### Deviation 4: Added `class-validator` and `class-transformer` as runtime dependencies
-
-**Was it necessary?** Yes. The `ValidationPipe` in `main.ts` uses `transform: true` and `whitelist: true`. These options are no-ops without `class-transformer` and `class-validator` installed at runtime. Even though no DTOs are defined in Phase 1, the pipe is active and these packages are its peer dependencies. Without them, a future DTO decorated with `@IsString()` would fail silently.
-
-**Correctly implemented?** Yes — both are in `dependencies` (runtime), not `devDependencies`. Versions are appropriate (`class-validator ^0.15.1`, `class-transformer ^0.5.1`).
-
-**Any risk?** Low. These are the standard NestJS validation stack. One note: CLAUDE.md lists "Zod" as the validation tool. Using `class-validator` alongside `zod` is acceptable for DTO validation (the two serve different layers), but the team should document which validator is used where to avoid drift.
+| # | Deviation | Verdict | Reasoning |
+|---|-----------|---------|-----------|
+| 1 | Only MSSQL implemented; other driver types throw `UnsupportedDriverError` | **Justified** | The exhaustive `never` check in `driver-factory.ts` line 19 provides compile-time safety when new types are added to `DataSourceType`. Correct Phase 2 scope; no dead code. |
+| 2 | Package renamed `PoolManager` (was `ConnectionPoolManager` in plan) | **Justified** | Shorter name, identical semantics, no public API contract yet. Zero impact. |
+| 3 | No Prisma — in-memory `DataSourceRepository` stub | **Justified** | Prisma schema is not yet migrated. The stub faithfully mirrors Prisma semantics (`null` on not found, typed return values). Phase 3 replaces it. The abstraction layer (repository pattern) makes this a clean swap. |
+| 4 | MSSQL connection string string overload passed to `mssql.connect` | **Justified with caveat** | `mssql.connect(connectionString)` is a documented overload. The string originates from AES-256-GCM decryption, never from raw user input, and is never logged (confirmed by search). **Caveat:** documentation and examples in the repo should note that production connection strings must include `Encrypt=true;TrustServerCertificate=false` to prevent MITM. |
+| 5 | No `nestjs-pino` — NestJS built-in `Logger` in API layer, custom `createLogger` in `db-drivers` | **Acceptable for Phase 2** | CLAUDE.md specifies Pino but `nestjs-pino` integration is a cross-cutting infrastructure decision. The custom logger produces structured JSON to stdout/stderr which Pino-compatible collectors can ingest. Must be upgraded to `nestjs-pino` in Phase 3 when HTTP request logging and correlation IDs are needed. |
 
 ---
 
 ## Verdict Details
 
-**APPROVED_WITH_CHANGES**
+**APPROVED_WITH_CHANGES.** The implementation is architecturally correct and the security-critical paths (encryption, query guard, error masking) are sound. All three critical issues are contained to the `execute` query path (C-1, C-2) and a style violation (C-3); none require architectural redesign.
 
-The skeleton is well-built. Strict TypeScript mode is fully applied, security practices are followed, the NestJS/Fastify setup is correct, and the monorepo plumbing (pnpm, turbo, tsconfig inheritance) is sound. The four builder deviations all improve correctness over the plan.
+**Required before commit:**
 
-**Required changes before tester can proceed:**
+1. **C-1** — Set `request.timeout = this.queryTimeoutMs` in `mssql.driver.ts` before calling `request.query(sql)` to enforce the timeout at the TDS protocol level.
+2. **C-2** — Create `ExecuteQueryDto` class with `@IsString() @MinLength(1) sql` and `@IsOptional() @IsArray() params`, and use it in the `executeQuery` controller action.
+3. **C-3** — Add `: DataSourceDriver` explicit return type to `DataSourceService.getDriver`.
 
-1. **Fix `HealthResponse` duplication** — export from `app.service.ts`, import in `app.controller.ts`. This is the only structural issue. (Critical #1)
-2. **Remove or document `@typescript-eslint/dot-notation: off`** in `apps/api/.eslintrc.js`. If there is a NestJS-specific reason it must be off, add a comment. If not, remove it to keep CORS/env-access enforcement intact. (Critical #2)
-
-These two changes are small (< 10 lines total) and do not affect any pipeline steps.
+Warnings W-1 through W-5 should be tracked as follow-up tickets but do not block commit given the Phase 2 scope.
 
 ---
 
-## Handoff to Tester
+## Handoff Note
 
-The tester can proceed once the two critical fixes are applied. Focus areas:
+**Needs fixes first (C-1, C-2, C-3).** Builder should address the three critical items. Once resolved, hand off to the tester agent with the following targets:
 
-1. **Run unit tests** (`pnpm --filter=@datascriba/api test`) — confirm all 3 pass, especially the ISO timestamp test which exercises a real `Date` object.
-2. **Run e2e tests** (`pnpm --filter=@datascriba/api test:e2e`) — confirm `GET /health` returns HTTP 200 with the correct body shape. Note: the e2e test uses `supertest` against a real Fastify instance; the `app.getHttpAdapter().getInstance().ready()` call is critical and is already present.
-3. **Strengthen e2e timestamp assertion** — update `app.e2e-spec.ts` line 47 to validate ISO format, not just `typeof === 'string'` (Warning #4).
-4. **Coverage** — target at least 80% on `app.service.ts` and `app.controller.ts`; current unit tests already cover all branches of the only exported method, so coverage should be near 100% for those files.
-5. **Edge cases to probe:**
-   - What does `GET /api/v1/health` return? It should 404 because `/health` is excluded from the global prefix (routed as `/health`, not `/api/v1/health`). Verify this is intentional and add a test if needed.
-   - Start the server with `NODE_ENV=production` and confirm Swagger UI is not reachable at `/api/docs`.
+- Verify `request.timeout` is enforced: mock a slow query and assert `QueryTimeoutError` is thrown within the configured window (not after).
+- Add tests for `ExecuteQueryDto`: missing `sql` field yields `400`, non-string `sql` yields `400`.
+- Add a test for `update` with a new `connectionString` verifying re-encryption in the repository (mirrors the existing `create` encryption test).
+- Add `afterEach(() => vi.unstubAllEnvs())` to `data-source.service.spec.ts`.
+- Verify `query-guard.spec.ts` covers `INSERT` and `UPDATE` as explicitly allowed operations.
