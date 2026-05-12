@@ -1,0 +1,11 @@
+{
+  "name": "@datascriba/tsconfig",
+  "version": "0.0.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "files": ["*.json"],
+  "exports": {
+    "./base.json": "./base.json",
+    "./nestjs.json": "./nestjs.json"
+  }
+}
