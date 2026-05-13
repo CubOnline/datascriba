@@ -6,6 +6,7 @@ import { AppController } from './app.controller'
 import { AppService } from './app.service'
 import { AppExceptionFilter } from './common/filters/app-exception.filter'
 import { DataSourceModule } from './modules/data-source/data-source.module'
+import { ReportModule } from './modules/report/report.module'
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { DataSourceModule } from './modules/data-source/data-source.module'
       envFilePath: ['.env.local', '.env'],
     }),
     DataSourceModule,
+    ReportModule,
   ],
   controllers: [AppController],
   providers: [

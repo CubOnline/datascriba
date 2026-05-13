@@ -44,3 +44,7 @@ apps/api/src/generated
 
 # Agent memory (sensitive)
 .claude/agent-memory/**/*.local.md
+
+# Report engine output files
+apps/api/output/*.csv
+apps/api/output/*.xlsx

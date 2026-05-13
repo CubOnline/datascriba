@@ -8,6 +8,12 @@ import {
   UnsupportedDriverError,
 } from '@datascriba/db-drivers'
 import {
+  ParameterValidationError,
+  RenderError,
+  TemplateError,
+  UnsupportedFormatError,
+} from '@datascriba/report-engine'
+import {
   ArgumentsHost,
   Catch,
   ExceptionFilter,
@@ -79,6 +85,19 @@ export class AppExceptionFilter implements ExceptionFilter {
     }
     if (exception instanceof DataSourceError) {
       return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Data source error' }
+    }
+    // Report engine errors
+    if (exception instanceof ParameterValidationError) {
+      return { statusCode: 422, message: exception.message }
+    }
+    if (exception instanceof TemplateError) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: exception.message }
+    }
+    if (exception instanceof UnsupportedFormatError) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: exception.message }
+    }
+    if (exception instanceof RenderError) {
+      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: exception.message }
     }
     return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Internal server error' }
   }

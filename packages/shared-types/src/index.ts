@@ -7,3 +7,11 @@ export type {
   QueryResult,
   DataSourceRecord,
 } from './data-source'
+export type {
+  ExportFormat,
+  ReportParameterType,
+  ReportParameter,
+  ReportDefinition,
+  RunStatus,
+  RunRecord,
+} from './report'
