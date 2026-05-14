@@ -5,7 +5,7 @@
     "build": {
       "dependsOn": ["^build"],
       "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": ["dist/**"]
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**"]
     },
     "dev": {
       "cache": false,
@@ -28,6 +28,9 @@
       "dependsOn": ["build"],
       "inputs": ["$TURBO_DEFAULT$"],
       "cache": false
+    },
+    "test:coverage": {
+      "dependsOn": ["^build"]
     },
     "format:check": {
       "inputs": ["$TURBO_DEFAULT$"]

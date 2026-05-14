@@ -30,6 +30,10 @@ export interface DataSourceRecord {
   workspaceId: string
   name: string
   type: DataSourceType
+  host: string
+  port: number
+  database: string
+  username: string
   encryptedConnectionString: string
   createdAt: Date
   updatedAt: Date
