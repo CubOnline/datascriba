@@ -22,3 +22,9 @@ export type {
   ExplainQueryResponse,
   AiSseChunk,
 } from './ai'
+// Faz 6 — Schedule types
+export type {
+  ScheduleDefinition,
+  CreateScheduleRequest,
+  UpdateScheduleRequest,
+} from './schedule'

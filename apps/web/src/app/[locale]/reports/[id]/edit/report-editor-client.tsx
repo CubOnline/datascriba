@@ -1,7 +1,8 @@
 'use client'
 import dynamic from 'next/dynamic'
 import { useTranslations } from 'next-intl'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
+import { Clock } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,6 +12,7 @@ import { useReport, useCreateReport, useUpdateReport } from '@/hooks/use-reports
 import { useDataSources } from '@/hooks/use-data-sources'
 import { useReportEditorStore } from '@/store/report-editor.store'
 import { AiAssistantPanel } from '@/components/ai/ai-assistant-panel'
+import { CreateScheduleDialog } from '../../../schedules/create-schedule-dialog'
 import { ParameterList } from './parameter-list'
 import { useRouter } from 'next/navigation'
 
@@ -23,8 +25,10 @@ interface ReportEditorClientProps {
 export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
   const t = useTranslations('report')
   const tc = useTranslations('common')
+  const ts = useTranslations('schedule')
   const router = useRouter()
 
+  const [scheduleOpen, setScheduleOpen] = useState(false)
   const store = useReportEditorStore()
   const loadReport = useReportEditorStore((s) => s.loadReport)
   const { data: report } = useReport(reportId ?? '')
@@ -91,6 +95,12 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
           <div className="flex gap-2">
             {store.isDirty && (
               <span className="text-sm text-muted-foreground self-center">{tc('unsavedChanges')}</span>
+            )}
+            {reportId && (
+              <Button variant="outline" size="sm" onClick={() => setScheduleOpen(true)}>
+                <Clock className="mr-2 h-4 w-4" />
+                {ts('scheduleReport')}
+              </Button>
             )}
             <Button onClick={handleSave} disabled={isPending}>
               {tc('save')}
@@ -175,6 +185,14 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
         currentSql={store.query}
         onApplySql={(sql) => store.setField('query', sql)}
       />
+
+      {reportId && (
+        <CreateScheduleDialog
+          open={scheduleOpen}
+          onOpenChange={setScheduleOpen}
+          initialReportId={reportId}
+        />
+      )}
     </div>
   )
 }

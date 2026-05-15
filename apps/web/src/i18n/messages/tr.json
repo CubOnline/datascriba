@@ -22,6 +22,7 @@
   "nav": {
     "dataSources": "Veri Kaynakları",
     "reports": "Raporlar",
+    "schedules": "Zamanlamalar",
     "settings": "Ayarlar"
   },
   "dataSource": {
@@ -62,6 +63,26 @@
     "paramLabel": "Etiket",
     "paramRequired": "Zorunlu",
     "paramDefault": "Varsayılan Değer"
+  },
+  "schedule": {
+    "title": "Zamanlamalar",
+    "createNew": "Yeni Zamanlama",
+    "editTitle": "Zamanlama Duzenle",
+    "report": "Rapor",
+    "cronExpression": "Cron Ifadesi",
+    "cronPreview": "Sonraki calisma",
+    "format": "Disa Aktarma Formati",
+    "notifyEmail": "Bildirim E-postasi",
+    "notifyEmailPlaceholder": "raporlar@sirket.com",
+    "enabled": "Aktif",
+    "lastRunAt": "Son Calisma",
+    "nextRunAt": "Sonraki Calisma",
+    "trigger": "Simdi Calistir",
+    "triggered": "Is kuyruga eklendi",
+    "deleteConfirm": "Bu zamanlama silinsin mi?",
+    "noSchedules": "Henuz zamanlama yok. Raporlarınızı otomatlastirmak icin bir tane olusturun.",
+    "scheduleReport": "Zamanla",
+    "invalidCron": "Gecersiz cron ifadesi"
   },
   "ai": {
     "panelTitle": "Scriba AI",

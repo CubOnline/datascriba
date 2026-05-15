@@ -26,7 +26,7 @@ export function IsPublicHost(validationOptions?: ValidationOptions) {
   return function (object: object, propertyName: string): void {
     registerDecorator({
       name: 'isPublicHost',
-      target: (object as { constructor: Function }).constructor,
+      target: (object as { constructor: new (...args: unknown[]) => unknown }).constructor,
       propertyName,
       options: {
         message: 'Private, loopback, and link-local addresses are not allowed',

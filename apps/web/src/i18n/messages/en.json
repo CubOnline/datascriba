@@ -22,6 +22,7 @@
   "nav": {
     "dataSources": "Data Sources",
     "reports": "Reports",
+    "schedules": "Schedules",
     "settings": "Settings"
   },
   "dataSource": {
@@ -62,6 +63,26 @@
     "paramLabel": "Label",
     "paramRequired": "Required",
     "paramDefault": "Default Value"
+  },
+  "schedule": {
+    "title": "Schedules",
+    "createNew": "New Schedule",
+    "editTitle": "Edit Schedule",
+    "report": "Report",
+    "cronExpression": "Cron Expression",
+    "cronPreview": "Next run",
+    "format": "Export Format",
+    "notifyEmail": "Notification Email",
+    "notifyEmailPlaceholder": "reports@company.com",
+    "enabled": "Enabled",
+    "lastRunAt": "Last Run",
+    "nextRunAt": "Next Run",
+    "trigger": "Run Now",
+    "triggered": "Job enqueued",
+    "deleteConfirm": "Are you sure you want to delete this schedule?",
+    "noSchedules": "No schedules yet. Create one to automate your reports.",
+    "scheduleReport": "Schedule",
+    "invalidCron": "Invalid cron expression"
   },
   "ai": {
     "panelTitle": "Scriba AI",

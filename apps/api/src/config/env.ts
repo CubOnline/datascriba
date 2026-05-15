@@ -16,6 +16,16 @@ const envSchema = z.object({
   AI_MODEL: z.string().default('claude-sonnet-4-6'),
   /** AI endpoint başına dakikada maksimum istek sayısı */
   AI_RATE_LIMIT_RPM: z.coerce.number().int().min(1).default(10),
+  // Queue / Redis
+  REDIS_HOST: z.string().default('127.0.0.1'),
+  REDIS_PORT: z.coerce.number().int().min(1).max(65535).default(6379),
+  REDIS_PASSWORD: z.string().optional(),
+  // SMTP (optional — e-posta bildirim ozelligi)
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().default(587),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().email().optional(),
 })
 
 export type Env = z.infer<typeof envSchema>
@@ -51,5 +61,13 @@ export const env: Env = (() => {
     ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] ?? '',
     AI_MODEL: process.env['AI_MODEL'] ?? 'claude-sonnet-4-6',
     AI_RATE_LIMIT_RPM: 10,
+    REDIS_HOST: process.env['REDIS_HOST'] ?? '127.0.0.1',
+    REDIS_PORT: 6379,
+    REDIS_PASSWORD: process.env['REDIS_PASSWORD'],
+    SMTP_HOST: process.env['SMTP_HOST'],
+    SMTP_PORT: 587,
+    SMTP_USER: process.env['SMTP_USER'],
+    SMTP_PASS: process.env['SMTP_PASS'],
+    SMTP_FROM: process.env['SMTP_FROM'],
   } as Env
 })()

@@ -24,17 +24,83 @@ services:
     image: redis:7-alpine
     container_name: datascriba-redis
     restart: unless-stopped
+    # Pass REDIS_PASSWORD from the host .env file so Redis requires auth.
+    # Set REDIS_PASSWORD in .env (never commit it). Fallback empty string
+    # keeps local dev working without a password, but production MUST set it.
+    command: >
+      sh -c '
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          redis-server --requirepass "$$REDIS_PASSWORD"
+        else
+          redis-server
+        fi
+      '
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
       - '6379:6379'
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test:
+        - 'CMD-SHELL'
+        - |
+          if [ -n "$$REDIS_PASSWORD" ]; then
+            redis-cli -a "$$REDIS_PASSWORD" ping
+          else
+            redis-cli ping
+          fi
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 5s
 
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    container_name: datascriba-api
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+    ports:
+      - '${API_PORT:-3001}:3001'
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3001/health']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build:
+      context: ..
+      dockerfile: apps/worker/Dockerfile
+    container_name: datascriba-worker
+    restart: unless-stopped
+    env_file: ../.env
+    environment:
+      NODE_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: '6379'
+      INTERNAL_API_URL: http://api:3001
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    volumes:
+      - report_output:/app/output
+
 volumes:
   postgres_data:
   redis_data:
+  report_output:

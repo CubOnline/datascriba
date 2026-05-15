@@ -1,5 +1,5 @@
 'use client'
-import { Database, FileText, Settings } from 'lucide-react'
+import { Calendar, Database, FileText, Settings } from 'lucide-react'
 import { useTranslations } from 'next-intl'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
@@ -8,6 +8,7 @@ import { cn } from '@/lib/utils'
 const navItems = [
   { href: '/data-sources', icon: Database, labelKey: 'dataSources' },
   { href: '/reports', icon: FileText, labelKey: 'reports' },
+  { href: '/schedules', icon: Calendar, labelKey: 'schedules' },
   { href: '/settings', icon: Settings, labelKey: 'settings' },
 ] as const
 

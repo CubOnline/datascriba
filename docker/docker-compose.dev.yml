@@ -1,0 +1,27 @@
+version: '3.9'
+
+# Development override — mount source for hot reload
+# Usage: docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up
+
+services:
+  api:
+    build:
+      target: development
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ../apps/api:/app/apps/api
+      - ../packages:/app/packages
+      - /app/node_modules
+    command: pnpm --filter=api dev
+
+  worker:
+    build:
+      target: development
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ../apps/worker:/app/apps/worker
+      - ../packages:/app/packages
+      - /app/node_modules
+    command: pnpm --filter=worker dev

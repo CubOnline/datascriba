@@ -21,7 +21,10 @@
     "db:studio": "pnpm --filter=@datascriba/api prisma studio",
     "db:seed": "pnpm --filter=@datascriba/api prisma db seed",
     "docker:up": "docker compose -f docker/docker-compose.yml up -d",
-    "docker:down": "docker compose -f docker/docker-compose.yml down"
+    "docker:down": "docker compose -f docker/docker-compose.yml down",
+    "docker:dev": "docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up -d",
+    "worker:dev": "pnpm --filter=@datascriba/worker dev",
+    "worker:build": "pnpm --filter=@datascriba/worker build"
   },
   "devDependencies": {
     "turbo": "^2.3.3",
