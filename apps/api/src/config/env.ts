@@ -10,6 +10,12 @@ const envSchema = z.object({
   ENCRYPTION_MASTER_KEY: z
     .string()
     .regex(HEX_64, 'ENCRYPTION_MASTER_KEY must be a 64-character hex string (32 bytes)'),
+  /** Anthropic API anahtarı — AI özellikleri için zorunlu */
+  ANTHROPIC_API_KEY: z.string().min(1, 'ANTHROPIC_API_KEY is required'),
+  /** Kullanılacak Claude modeli. Varsayılan: claude-sonnet-4-6 */
+  AI_MODEL: z.string().default('claude-sonnet-4-6'),
+  /** AI endpoint başına dakikada maksimum istek sayısı */
+  AI_RATE_LIMIT_RPM: z.coerce.number().int().min(1).default(10),
 })
 
 export type Env = z.infer<typeof envSchema>
@@ -36,14 +42,14 @@ export function validateEnv(): Env {
  */
 export const env: Env = (() => {
   const result = envSchema.safeParse(process.env)
-  // During module load we return a best-effort parse (may have defaults).
-  // The authoritative validation and exit happens in validateEnv() at bootstrap.
   if (result.success) return result.data
-  // Provide safe defaults so module loading doesn't crash during tests
   return {
     NODE_ENV: 'development',
     API_PORT: 3001,
     API_HOST: '0.0.0.0',
     ENCRYPTION_MASTER_KEY: process.env['ENCRYPTION_MASTER_KEY'] ?? '',
+    ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] ?? '',
+    AI_MODEL: process.env['AI_MODEL'] ?? 'claude-sonnet-4-6',
+    AI_RATE_LIMIT_RPM: 10,
   } as Env
 })()

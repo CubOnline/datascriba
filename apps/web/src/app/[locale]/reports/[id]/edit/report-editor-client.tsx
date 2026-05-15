@@ -10,6 +10,7 @@ import { Switch } from '@/components/ui/switch'
 import { useReport, useCreateReport, useUpdateReport } from '@/hooks/use-reports'
 import { useDataSources } from '@/hooks/use-data-sources'
 import { useReportEditorStore } from '@/store/report-editor.store'
+import { AiAssistantPanel } from '@/components/ai/ai-assistant-panel'
 import { ParameterList } from './parameter-list'
 import { useRouter } from 'next/navigation'
 
@@ -67,15 +68,12 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
         await updateReport.mutateAsync(payload)
       } else {
         const created = await createReport.mutateAsync(payload)
-        // Validate id is a safe alphanumeric/UUID segment before navigating
         const safeId = /^[\w-]+$/.test(created.id) ? created.id : null
         if (!safeId) throw new Error('Invalid report id returned from server')
         router.push(`/reports/${safeId}/edit`)
       }
       store.resetDirty()
     } catch (err) {
-      // Errors are surfaced via mutation state (isError / error) on the
-      // respective mutation; re-throw so React Query captures it correctly.
       throw err
     }
   }
@@ -83,90 +81,100 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
   const isPending = createReport.isPending || updateReport.isPending
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">
-          {reportId ? t('editTitle') : t('createNew')}
-        </h1>
-        <div className="flex gap-2">
-          {store.isDirty && (
-            <span className="text-sm text-muted-foreground self-center">{tc('unsavedChanges')}</span>
-          )}
-          <Button onClick={handleSave} disabled={isPending}>
-            {tc('save')}
-          </Button>
+    <div className="flex h-full">
+      {/* Ana editor alani */}
+      <div className="flex-1 overflow-auto space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">
+            {reportId ? t('editTitle') : t('createNew')}
+          </h1>
+          <div className="flex gap-2">
+            {store.isDirty && (
+              <span className="text-sm text-muted-foreground self-center">{tc('unsavedChanges')}</span>
+            )}
+            <Button onClick={handleSave} disabled={isPending}>
+              {tc('save')}
+            </Button>
+          </div>
         </div>
-      </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="space-y-4">
-          <div className="space-y-1">
-            <Label>{tc('name')}</Label>
-            <Input value={store.name} onChange={(e) => store.setField('name', e.target.value)} />
-          </div>
-          <div className="space-y-1">
-            <Label>{tc('description')}</Label>
-            <Input
-              value={store.description}
-              onChange={(e) => store.setField('description', e.target.value)}
-            />
-          </div>
-          <div className="space-y-1">
-            <Label>Data Source</Label>
-            <Select
-              value={store.dataSourceId}
-              onValueChange={(v) => store.setField('dataSourceId', v)}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select data source..." />
-              </SelectTrigger>
-              <SelectContent>
-                {dataSources?.map((ds) => (
-                  <SelectItem key={ds.id} value={ds.id}>{ds.name}</SelectItem>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-4">
+            <div className="space-y-1">
+              <Label>{tc('name')}</Label>
+              <Input value={store.name} onChange={(e) => store.setField('name', e.target.value)} />
+            </div>
+            <div className="space-y-1">
+              <Label>{tc('description')}</Label>
+              <Input
+                value={store.description}
+                onChange={(e) => store.setField('description', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label>Data Source</Label>
+              <Select
+                value={store.dataSourceId}
+                onValueChange={(v) => store.setField('dataSourceId', v)}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select data source..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {dataSources?.map((ds) => (
+                    <SelectItem key={ds.id} value={ds.id}>{ds.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>{t('exportFormats')}</Label>
+              <div className="flex gap-4">
+                {(['csv', 'excel'] as const).map((fmt) => (
+                  <div key={fmt} className="flex items-center gap-2">
+                    <Switch
+                      checked={store.exportFormats.includes(fmt)}
+                      onCheckedChange={(checked) => {
+                        const next = checked
+                          ? [...store.exportFormats, fmt]
+                          : store.exportFormats.filter((f) => f !== fmt)
+                        store.setField('exportFormats', next)
+                      }}
+                    />
+                    <Label className="capitalize">{fmt}</Label>
+                  </div>
                 ))}
-              </SelectContent>
-            </Select>
+              </div>
+            </div>
           </div>
+
           <div className="space-y-1">
-            <Label>{t('exportFormats')}</Label>
-            <div className="flex gap-4">
-              {(['csv', 'excel'] as const).map((fmt) => (
-                <div key={fmt} className="flex items-center gap-2">
-                  <Switch
-                    checked={store.exportFormats.includes(fmt)}
-                    onCheckedChange={(checked) => {
-                      const next = checked
-                        ? [...store.exportFormats, fmt]
-                        : store.exportFormats.filter((f) => f !== fmt)
-                      store.setField('exportFormats', next)
-                    }}
-                  />
-                  <Label className="capitalize">{fmt}</Label>
-                </div>
-              ))}
+            <Label>{t('query')}</Label>
+            <div className="h-64 rounded-md border overflow-hidden">
+              <MonacoEditor
+                height="100%"
+                language="sql"
+                theme="vs-dark"
+                value={store.query}
+                onChange={(v) => store.setField('query', v ?? '')}
+                options={{ minimap: { enabled: false }, fontSize: 13, wordWrap: 'on' }}
+              />
             </div>
           </div>
         </div>
 
-        <div className="space-y-1">
-          <Label>{t('query')}</Label>
-          <div className="h-64 rounded-md border overflow-hidden">
-            <MonacoEditor
-              height="100%"
-              language="sql"
-              theme="vs-dark"
-              value={store.query}
-              onChange={(v) => store.setField('query', v ?? '')}
-              options={{ minimap: { enabled: false }, fontSize: 13, wordWrap: 'on' }}
-            />
-          </div>
+        <div className="space-y-2">
+          <Label>{t('parameters')}</Label>
+          <ParameterList />
         </div>
       </div>
 
-      <div className="space-y-2">
-        <Label>{t('parameters')}</Label>
-        <ParameterList />
-      </div>
+      {/* AI Yardimcisi paneli -- sagda, collapsible */}
+      <AiAssistantPanel
+        dataSourceId={store.dataSourceId}
+        currentSql={store.query}
+        onApplySql={(sql) => store.setField('query', sql)}
+      />
     </div>
   )
 }

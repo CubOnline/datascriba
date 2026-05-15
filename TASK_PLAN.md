@@ -1,47 +1,1325 @@
-# TASK_PLAN.md — Phase 4: Görsel Rapor Tasarımcısı
+# TASK_PLAN.md — Phase 5: Scriba AI
 
 **Agent:** builder
-**Phase:** 4
-**Effort:** XL (~3-4 weeks)
-**Created by:** planner
-**Date:** 2026-05-14
+**Phase:** 5
+**Planner:** planner (claude-sonnet-4-6)
+**Tarih:** 2026-05-15
+**Bağımlı Fazlar:** Faz 2 (DataSource + db-drivers), Faz 3 (ReportModule)
 
 ---
 
-## Hedef
+## Genel Bakış
 
-`apps/web` altında Next.js 15 App Router tabanlı bir frontend oluşturmak:
-- Rapor tanımı oluşturma / düzenleme (sürükle-bırak parametre yönetimi, Monaco SQL editörü)
-- Veri kaynağı yönetimi (listeleme, bağlantı testi, CRUD)
-- Rapor çalıştırma & dosya indirme (CSV / Excel)
-- Geçmiş çalıştırma kayıtları
-- Dark mode, EN + TR i18n
+Faz 5, DataScriba'ya Anthropic Claude tabanlı AI yardımcısı ekler. Kullanıcılar rapor editöründe doğal dil ile SQL önerisi alabilir, mevcut SQL'i açıklayabilir ve hatalı SQL'i düzeltebilir.
+
+### Mimari Kararlar
+
+- **packages/ai-client/**: Anthropic SDK wrapper paketi — API'den bağımsız, test edilebilir
+- **AI modülü NestJS'e entegre**: `AiModule` → `AppModule`'e import edilir
+- **Streaming**: NestJS `@Sse()` decorator + Fastify SSE — her chunk `data:` satırı olarak gönderilir
+- **Rate limiting**: `@nestjs/throttler` global + AI endpoint'lerine özel TTL
+- **Prompt caching**: Sistem promptu `cache_control: { type: 'ephemeral' }` ile cache'lenir
+- **Şema**: MSSQL `INFORMATION_SCHEMA` — `DataSourceService.listTables()` + `describeTable()` reuse
+- **Frontend panel**: Collapsible sidebar — `RadixUI` `@radix-ui/react-collapsible` + Tabs
 
 ---
 
-## Teknoloji Kararları
+## Bağımlılık Grafiği
 
-| Bileşen | Seçim |
-|---------|-------|
-| Framework | Next.js 15.3 App Router |
-| Stil | TailwindCSS 4 (`@import "tailwindcss"`, config dosyası yok) |
-| Komponent kütüphanesi | shadcn/ui v2 |
-| State (client) | Zustand 5 + zundo (undo/redo) |
-| State (server) | TanStack Query v5 |
-| Sürükle-bırak | @dnd-kit/core |
-| SQL editörü | Monaco Editor (dynamic, ssr:false) |
-| i18n | next-intl v3 |
-| Tema | next-themes |
-| Form | React Hook Form + Zod resolver |
-| HTTP client | fetch (native) + custom wrapper |
+```
+STEP-01: packages/ai-client paket iskeleti
+    ↓
+STEP-02: packages/ai-client/src/types.ts
+    ↓
+STEP-03: packages/ai-client/src/prompts/*.ts
+    ↓
+STEP-04: packages/ai-client/src/client.ts (Anthropic wrapper)
+    ↓
+STEP-05: packages/ai-client/src/index.ts (exports)
+    ↓
+STEP-06: packages/shared-types/src/ai.ts (AI tipleri)
+    ↓
+STEP-07: apps/api — @nestjs/throttler bağımlılığı + env.ts güncelleme
+    ↓
+STEP-08: apps/api/src/modules/ai/dto/*.ts
+    ↓
+STEP-09: apps/api/src/modules/ai/ai.service.ts
+    ↓
+STEP-10: apps/api/src/modules/ai/ai.controller.ts
+    ↓
+STEP-11: apps/api/src/modules/ai/ai.module.ts
+    ↓
+STEP-12: apps/api/src/app.module.ts güncellemesi (ThrottlerModule + AiModule)
+    ↓
+STEP-13: apps/api/src/common/filters/app-exception.filter.ts güncellemesi
+    ↓
+STEP-14: apps/web — @radix-ui/react-collapsible bağımlılığı
+    ↓
+STEP-15: apps/web/src/hooks/use-ai.ts
+    ↓
+STEP-16: apps/web/src/components/ui/collapsible.tsx
+    ↓
+STEP-17: apps/web/src/components/ui/tabs.tsx (shadcn wrapper)
+    ↓
+STEP-18: apps/web/src/components/ai/ai-assistant-panel.tsx
+    ↓
+STEP-19: apps/web/src/app/[locale]/reports/[id]/edit/report-editor-client.tsx güncellemesi
+    ↓
+STEP-20: i18n mesaj dosyaları güncelleme (en.json + tr.json)
+    ↓
+STEP-21: packages/shared-types/src/index.ts güncelleme
+    ↓
+STEP-22: apps/api/src/modules/ai/ai.service.spec.ts (birim test)
+    ↓
+STEP-23: .env.example güncelleme
+```
 
 ---
 
 ## Görevler
 
-### STEP-01: apps/web package.json
+### STEP-01: packages/ai-client — Paket İskeleti
 
-Dosya: `apps/web/package.json`
+**Oluşturulacak dosyalar:**
+- `packages/ai-client/package.json`
+- `packages/ai-client/tsconfig.json`
+
+**Bağımlılıklar:** Yok (ilk adım)
+
+**packages/ai-client/package.json:**
+
+```json
+{
+  "name": "@datascriba/ai-client",
+  "version": "0.0.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@datascriba/shared-types": "workspace:*"
+  },
+  "devDependencies": {
+    "@datascriba/eslint-config": "workspace:*",
+    "@datascriba/tsconfig": "workspace:*",
+    "@swc/core": "^1.15.33",
+    "@types/node": "^22.10.7",
+    "@vitest/coverage-v8": "^2.1.9",
+    "typescript": "^5.5.4",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^2.1.9"
+  }
+}
+```
+
+**packages/ai-client/tsconfig.json:**
+
+```json
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "@datascriba/tsconfig/base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+```
+
+**Not:** `pnpm install` sonrası `@anthropic-ai/sdk` paketi `node_modules` altına gelir. Turborepo bu paketi otomatik tanır çünkü `pnpm-workspace.yaml` `packages/*` pattern'ini içerir.
+
+---
+
+### STEP-02: packages/ai-client/src/types.ts
+
+**Oluşturulacak dosya:** `packages/ai-client/src/types.ts`
+
+**Bağımlılıklar:** STEP-01
+
+```typescript
+import type { ColumnMeta, TableMeta } from '@datascriba/shared-types'
+
+/**
+ * Veri kaynağı şema özeti — AI prompt'larına gönderilir.
+ * Sadece AI'ın ihtiyacı olan meta bilgiyi içerir.
+ */
+export interface SchemaContext {
+  dataSourceId: string
+  tables: Array<{
+    schema: string
+    name: string
+    type: TableMeta['type']
+    columns: ColumnMeta[]
+  }>
+}
+
+/**
+ * SQL öneri isteği payload'u.
+ */
+export interface SuggestQueryRequest {
+  prompt: string
+  dataSourceId: string
+  schemaContext: SchemaContext
+}
+
+/**
+ * SQL açıklama isteği payload'u.
+ */
+export interface ExplainQueryRequest {
+  sql: string
+}
+
+/**
+ * SQL düzeltme isteği payload'u.
+ */
+export interface FixQueryRequest {
+  sql: string
+  errorMessage: string
+}
+
+/**
+ * Streaming olmayan (tek seferlik) AI yanıtı.
+ */
+export interface AiTextResponse {
+  text: string
+  /** Anthropic model ID */
+  model: string
+  /** Input token sayısı (cache hit dahil) */
+  inputTokens: number
+  /** Output token sayısı */
+  outputTokens: number
+  /** Cache'e yazılan token sayısı (varsa) */
+  cacheCreationInputTokens: number
+  /** Cache'ten okunan token sayısı (varsa) */
+  cacheReadInputTokens: number
+}
+
+/**
+ * Streaming SSE chunk — frontend bu formatı bekler.
+ */
+export interface AiStreamChunk {
+  type: 'delta' | 'done' | 'error'
+  text?: string
+  error?: string
+}
+
+/**
+ * AiClient konfigürasyonu.
+ */
+export interface AiClientConfig {
+  apiKey: string
+  model: string
+  maxTokens?: number
+}
+```
+
+---
+
+### STEP-03: packages/ai-client/src/prompts/suggest-query.ts
+
+**Oluşturulacak dosya:** `packages/ai-client/src/prompts/suggest-query.ts`
+
+**Bağımlılıklar:** STEP-02
+
+```typescript
+import type { SchemaContext } from '../types'
+
+/**
+ * Cache'lenecek sistem promptu — suggest-query için.
+ * Kısa tutulur, şema context ayrı mesajda gönderilir.
+ */
+export const SUGGEST_QUERY_SYSTEM_PROMPT = `You are an expert SQL assistant specializing in Microsoft SQL Server (MSSQL / T-SQL).
+Your task is to generate a valid T-SQL SELECT query based on the user's natural language request and the provided database schema.
+
+Rules:
+- Output ONLY the SQL query, no explanation, no markdown code fences.
+- Use only the tables and columns from the provided schema.
+- Never use DROP, DELETE, UPDATE, INSERT, TRUNCATE, ALTER, CREATE, or EXEC.
+- Use proper T-SQL syntax: square bracket identifiers [schema].[table].[column].
+- Always qualify table names with their schema (e.g. [dbo].[Orders]).
+- Use TOP instead of LIMIT for row limiting.
+- If the request is ambiguous, generate the most reasonable interpretation.
+- If the request cannot be fulfilled with the given schema, respond with a single line: -- CANNOT_GENERATE: <reason>
+`.trim()
+
+/**
+ * Kullanıcı mesajını şema context ile birleştirir.
+ */
+export function buildSuggestQueryUserMessage(
+  prompt: string,
+  schemaContext: SchemaContext,
+): string {
+  const schemaLines: string[] = ['-- DATABASE SCHEMA --']
+
+  for (const table of schemaContext.tables) {
+    schemaLines.push(`\nTable: [${table.schema}].[${table.name}] (${table.type})`)
+    schemaLines.push('Columns:')
+    for (const col of table.columns) {
+      const pk = col.isPrimaryKey ? ' [PK]' : ''
+      const nullable = col.nullable ? ' NULL' : ' NOT NULL'
+      const def = col.defaultValue !== null ? ` DEFAULT ${col.defaultValue}` : ''
+      schemaLines.push(`  - ${col.name}: ${col.dataType}${nullable}${pk}${def}`)
+    }
+  }
+
+  schemaLines.push('\n-- USER REQUEST --')
+  schemaLines.push(prompt)
+
+  return schemaLines.join('\n')
+}
+```
+
+---
+
+### STEP-04: packages/ai-client/src/prompts/explain-query.ts
+
+**Oluşturulacak dosya:** `packages/ai-client/src/prompts/explain-query.ts`
+
+**Bağımlılıklar:** STEP-02
+
+```typescript
+/**
+ * Cache'lenecek sistem promptu — explain-query için.
+ */
+export const EXPLAIN_QUERY_SYSTEM_PROMPT = `You are an expert SQL educator specializing in Microsoft SQL Server (MSSQL / T-SQL).
+Your task is to explain a given SQL query in both Turkish and English.
+
+Output format (strict):
+---TR---
+<Türkçe açıklama — 2-4 cümle, teknik ama anlaşılır>
+---EN---
+<English explanation — 2-4 sentences, technical but clear>
+
+Rules:
+- Always use both language sections in exactly this format.
+- Explain what the query does, what tables it accesses, what conditions it applies, and what result it returns.
+- Do not rewrite the query. Do not suggest improvements unless explicitly asked.
+- If the input is not valid SQL, write: ---TR---\nGeçersiz SQL.\n---EN---\nInvalid SQL.
+`.trim()
+
+/**
+ * Kullanıcı mesajını oluşturur.
+ */
+export function buildExplainQueryUserMessage(sql: string): string {
+  return `Explain this SQL query:\n\n${sql}`
+}
+```
+
+---
+
+### STEP-05: packages/ai-client/src/prompts/fix-query.ts
+
+**Oluşturulacak dosya:** `packages/ai-client/src/prompts/fix-query.ts`
+
+**Bağımlılıklar:** STEP-02
+
+```typescript
+/**
+ * Cache'lenecek sistem promptu — fix-query için.
+ */
+export const FIX_QUERY_SYSTEM_PROMPT = `You are an expert SQL debugger specializing in Microsoft SQL Server (MSSQL / T-SQL).
+Your task is to fix a broken SQL query given the original query and the error message.
+
+Rules:
+- Output ONLY the corrected SQL query, no explanation, no markdown code fences.
+- Preserve the original intent of the query.
+- Use proper T-SQL syntax.
+- If the error cannot be fixed (e.g. references non-existent objects you cannot know), output the original query unchanged with a comment: -- FIX_FAILED: <reason>
+`.trim()
+
+/**
+ * Kullanıcı mesajını oluşturur.
+ */
+export function buildFixQueryUserMessage(sql: string, errorMessage: string): string {
+  return `Fix this SQL query.\n\nError: ${errorMessage}\n\nQuery:\n${sql}`
+}
+```
+
+---
+
+### STEP-06: packages/ai-client/src/client.ts
+
+**Oluşturulacak dosya:** `packages/ai-client/src/client.ts`
+
+**Bağımlılıklar:** STEP-02, STEP-03, STEP-04, STEP-05
+
+```typescript
+import Anthropic from '@anthropic-ai/sdk'
+
+import {
+  buildExplainQueryUserMessage,
+  EXPLAIN_QUERY_SYSTEM_PROMPT,
+} from './prompts/explain-query'
+import {
+  buildFixQueryUserMessage,
+  FIX_QUERY_SYSTEM_PROMPT,
+} from './prompts/fix-query'
+import {
+  buildSuggestQueryUserMessage,
+  SUGGEST_QUERY_SYSTEM_PROMPT,
+} from './prompts/suggest-query'
+import type {
+  AiClientConfig,
+  AiStreamChunk,
+  AiTextResponse,
+  ExplainQueryRequest,
+  FixQueryRequest,
+  SuggestQueryRequest,
+} from './types'
+
+const DEFAULT_MAX_TOKENS = 2048
+
+/**
+ * Anthropic SDK wrapper.
+ * Prompt caching etkin: sistem promptları `cache_control: { type: 'ephemeral' }` ile cache'lenir.
+ * Ephemeral cache TTL: 5 dakika (Anthropic default).
+ */
+export class AiClient {
+  private readonly client: Anthropic
+  private readonly model: string
+  private readonly maxTokens: number
+
+  constructor(config: AiClientConfig) {
+    this.client = new Anthropic({ apiKey: config.apiKey })
+    this.model = config.model
+    this.maxTokens = config.maxTokens ?? DEFAULT_MAX_TOKENS
+  }
+
+  /**
+   * Kullanıcının doğal dil isteğine göre SQL sorgusu önerir.
+   * Streaming — her chunk AsyncIterable<AiStreamChunk> ile döner.
+   */
+  async *suggestQuery(req: SuggestQueryRequest): AsyncIterable<AiStreamChunk> {
+    const userContent = buildSuggestQueryUserMessage(req.prompt, req.schemaContext)
+
+    const stream = this.client.messages.stream({
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: [
+        {
+          type: 'text',
+          text: SUGGEST_QUERY_SYSTEM_PROMPT,
+          // @ts-expect-error -- cache_control is supported in the API but not yet typed in all SDK versions
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: userContent }],
+    })
+
+    for await (const event of stream) {
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'text_delta'
+      ) {
+        yield { type: 'delta', text: event.delta.text }
+      }
+    }
+
+    yield { type: 'done' }
+  }
+
+  /**
+   * SQL sorgusunu Türkçe ve İngilizce olarak açıklar.
+   * Tek seferlik (non-streaming) yanıt döner.
+   */
+  async explainQuery(req: ExplainQueryRequest): Promise<AiTextResponse> {
+    const response = await this.client.messages.create({
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: [
+        {
+          type: 'text',
+          text: EXPLAIN_QUERY_SYSTEM_PROMPT,
+          // @ts-expect-error -- cache_control is supported in the API but not yet typed in all SDK versions
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [
+        {
+          role: 'user',
+          content: buildExplainQueryUserMessage(req.sql),
+        },
+      ],
+    })
+
+    const textBlock = response.content.find((b) => b.type === 'text')
+    const text = textBlock?.type === 'text' ? textBlock.text : ''
+
+    return {
+      text,
+      model: response.model,
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+      cacheCreationInputTokens:
+        // @ts-expect-error -- cache_creation_input_tokens is API field not in all SDK type versions
+        (response.usage.cache_creation_input_tokens as number | undefined) ?? 0,
+      cacheReadInputTokens:
+        // @ts-expect-error -- cache_read_input_tokens is API field not in all SDK type versions
+        (response.usage.cache_read_input_tokens as number | undefined) ?? 0,
+    }
+  }
+
+  /**
+   * Hatalı SQL'i hata mesajıyla birlikte düzeltir.
+   * Streaming — her chunk AsyncIterable<AiStreamChunk> ile döner.
+   */
+  async *fixQuery(req: FixQueryRequest): AsyncIterable<AiStreamChunk> {
+    const userContent = buildFixQueryUserMessage(req.sql, req.errorMessage)
+
+    const stream = this.client.messages.stream({
+      model: this.model,
+      max_tokens: this.maxTokens,
+      system: [
+        {
+          type: 'text',
+          text: FIX_QUERY_SYSTEM_PROMPT,
+          // @ts-expect-error -- cache_control is supported in the API but not yet typed in all SDK versions
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+      messages: [{ role: 'user', content: userContent }],
+    })
+
+    for await (const event of stream) {
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'text_delta'
+      ) {
+        yield { type: 'delta', text: event.delta.text }
+      }
+    }
+
+    yield { type: 'done' }
+  }
+}
+```
+
+---
+
+### STEP-07: packages/ai-client/src/index.ts (Exports)
+
+**Oluşturulacak dosya:** `packages/ai-client/src/index.ts`
+
+**Bağımlılıklar:** STEP-06
+
+```typescript
+export { AiClient } from './client'
+export type {
+  AiClientConfig,
+  AiStreamChunk,
+  AiTextResponse,
+  ExplainQueryRequest,
+  FixQueryRequest,
+  SchemaContext,
+  SuggestQueryRequest,
+} from './types'
+```
+
+---
+
+### STEP-08: packages/shared-types/src/ai.ts (Paylaşılan AI Tipleri)
+
+**Oluşturulacak dosya:** `packages/shared-types/src/ai.ts`
+
+**Bağımlılıklar:** Yok (shared-types bağımsız)
+
+Bu dosya frontend ve backend arasında paylaşılan HTTP request/response tiplerini tanımlar. `packages/ai-client/src/types.ts` iç SDK tiplerini içerirken bu dosya HTTP katmanı tiplerini içerir.
+
+```typescript
+/**
+ * AI HTTP endpoint request/response tipleri.
+ * Frontend ve backend tarafından import edilir.
+ */
+
+/** POST /ai/suggest-query request body */
+export interface SuggestQueryBody {
+  prompt: string
+  dataSourceId: string
+}
+
+/** POST /ai/explain-query request body */
+export interface ExplainQueryBody {
+  sql: string
+}
+
+/** POST /ai/fix-query request body */
+export interface FixQueryBody {
+  sql: string
+  errorMessage: string
+}
+
+/**
+ * explain-query endpoint yanıtı (non-streaming).
+ * Türkçe ve İngilizce bölümleri ayrıştırılmış halde döner.
+ */
+export interface ExplainQueryResponse {
+  turkish: string
+  english: string
+  model: string
+}
+
+/**
+ * Streaming SSE event data tipi.
+ * suggest-query ve fix-query endpoint'leri bu formatı kullanır.
+ * Her SSE satırı: `data: <JSON>\n\n`
+ */
+export interface AiSseChunk {
+  type: 'delta' | 'done' | 'error'
+  text?: string
+  error?: string
+}
+```
+
+---
+
+### STEP-09: packages/shared-types/src/index.ts Güncellemesi
+
+**Güncellenecek dosya:** `packages/shared-types/src/index.ts`
+
+**Bağımlılıklar:** STEP-08
+
+Mevcut içerik korunur, ai.ts export'u eklenir:
+
+```typescript
+export type { ApiResponse, PaginatedResponse } from './common'
+export type {
+  DataSourceType,
+  TableMeta,
+  ColumnMeta,
+  Row,
+  QueryResult,
+  DataSourceRecord,
+} from './data-source'
+export type {
+  ExportFormat,
+  ReportParameterType,
+  ReportParameter,
+  ReportDefinition,
+  RunStatus,
+  RunRecord,
+} from './report'
+export type {
+  SuggestQueryBody,
+  ExplainQueryBody,
+  FixQueryBody,
+  ExplainQueryResponse,
+  AiSseChunk,
+} from './ai'
+```
+
+---
+
+### STEP-10: apps/api — env.ts Güncellemesi
+
+**Güncellenecek dosya:** `apps/api/src/config/env.ts`
+
+**Bağımlılıklar:** STEP-01 (yeni paket eklenince önce env güncellenir)
+
+`ANTHROPIC_API_KEY` ve `AI_MODEL` env değişkenleri eklenir. `AI_MODEL` default olarak `claude-sonnet-4-6` ancak `.env` dosyasından override edilebilir.
+
+```typescript
+import { z } from 'zod'
+
+const HEX_64 = /^[0-9a-fA-F]{64}$/
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  API_PORT: z.coerce.number().int().min(1).max(65535).default(3001),
+  API_HOST: z.string().default('0.0.0.0'),
+  FRONTEND_URL: z.string().url().optional(),
+  ENCRYPTION_MASTER_KEY: z
+    .string()
+    .regex(HEX_64, 'ENCRYPTION_MASTER_KEY must be a 64-character hex string (32 bytes)'),
+  /** Anthropic API anahtarı — AI özellikleri için zorunlu */
+  ANTHROPIC_API_KEY: z.string().min(1, 'ANTHROPIC_API_KEY is required'),
+  /** Kullanılacak Claude modeli. Varsayılan: claude-sonnet-4-6 */
+  AI_MODEL: z.string().default('claude-sonnet-4-6'),
+  /** AI endpoint başına dakikada maksimum istek sayısı */
+  AI_RATE_LIMIT_RPM: z.coerce.number().int().min(1).default(10),
+})
+
+export type Env = z.infer<typeof envSchema>
+
+/**
+ * Validates process.env at startup. Exits with code 1 if any required
+ * variable is missing or malformed. App refuses to start on failure.
+ */
+export function validateEnv(): Env {
+  const result = envSchema.safeParse(process.env)
+  if (!result.success) {
+    const formatted = result.error.issues
+      .map((issue) => `  ${issue.path.join('.')}: ${issue.message}`)
+      .join('\n')
+    process.stderr.write(`Environment validation failed:\n${formatted}\n`)
+    process.exit(1)
+  }
+  return result.data
+}
+
+/**
+ * Exported parsed env — call validateEnv() first in main.ts.
+ * Tests can set process.env before importing this module.
+ */
+export const env: Env = (() => {
+  const result = envSchema.safeParse(process.env)
+  if (result.success) return result.data
+  return {
+    NODE_ENV: 'development',
+    API_PORT: 3001,
+    API_HOST: '0.0.0.0',
+    ENCRYPTION_MASTER_KEY: process.env['ENCRYPTION_MASTER_KEY'] ?? '',
+    ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] ?? '',
+    AI_MODEL: process.env['AI_MODEL'] ?? 'claude-sonnet-4-6',
+    AI_RATE_LIMIT_RPM: 10,
+  } as Env
+})()
+```
+
+---
+
+### STEP-11: apps/api/package.json Güncellemesi
+
+**Güncellenecek dosya:** `apps/api/package.json`
+
+**Bağımlılıklar:** STEP-01 (paket oluşturulmuş olmalı)
+
+`dependencies` bölümüne eklenenler:
+- `@datascriba/ai-client`: `workspace:*`
+- `@nestjs/throttler`: `^6.4.0`
+
+Tam güncellenmiş `package.json`:
+
+```json
+{
+  "name": "@datascriba/api",
+  "version": "0.0.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "node dist/main",
+    "start:prod": "NODE_ENV=production node dist/main",
+    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
+    "lint:check": "eslint \"{src,test}/**/*.ts\"",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "format": "prettier --write \"{src,test}/**/*.ts\""
+  },
+  "dependencies": {
+    "@datascriba/ai-client": "workspace:*",
+    "@datascriba/db-drivers": "workspace:*",
+    "@datascriba/report-engine": "workspace:*",
+    "@datascriba/shared-types": "workspace:*",
+    "@nestjs/common": "^10.4.15",
+    "@nestjs/config": "^10.4.15",
+    "@nestjs/core": "^10.4.15",
+    "@nestjs/platform-fastify": "^10.4.15",
+    "@nestjs/swagger": "^8.1.0",
+    "@nestjs/throttler": "^6.4.0",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "fastify": "^5.2.1",
+    "mssql": "^11.0.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@datascriba/eslint-config": "workspace:*",
+    "@datascriba/tsconfig": "workspace:*",
+    "@nestjs/cli": "^10.4.9",
+    "@nestjs/testing": "^10.4.15",
+    "@swc/core": "^1.15.33",
+    "@types/mssql": "^9.1.5",
+    "@types/node": "^22.10.7",
+    "@types/supertest": "^6.0.2",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.31.0",
+    "prettier": "^3.3.3",
+    "supertest": "^7.0.0",
+    "typescript": "^5.5.4",
+    "unplugin-swc": "^1.5.9",
+    "vitest": "^2.1.9"
+  }
+}
+```
+
+**Not:** Mevcut `@nestjs/config` versiyonu `^3.3.0`'dı; `@nestjs/common`/`@nestjs/core` ile uyumlu olması için builder paketi `^3.3.0` olarak bırakabilir. Önemli olan `@datascriba/ai-client` ve `@nestjs/throttler` eklenmesidir.
+
+---
+
+### STEP-12: apps/api/src/modules/ai/dto/suggest-query.dto.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/dto/suggest-query.dto.ts`
+
+**Bağımlılıklar:** STEP-10
+
+```typescript
+import { ApiProperty } from '@nestjs/swagger'
+import { IsString, IsUUID, MinLength, MaxLength } from 'class-validator'
+
+export class SuggestQueryDto {
+  @ApiProperty({
+    description: 'Natural language description of the desired SQL query',
+    example: 'Show me total sales grouped by product category for last month',
+    minLength: 5,
+    maxLength: 1000,
+  })
+  @IsString()
+  @MinLength(5)
+  @MaxLength(1000)
+  prompt!: string
+
+  @ApiProperty({
+    description: 'ID of the data source to query schema from',
+    format: 'uuid',
+  })
+  @IsString()
+  @IsUUID()
+  dataSourceId!: string
+}
+```
+
+---
+
+### STEP-13: apps/api/src/modules/ai/dto/explain-query.dto.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/dto/explain-query.dto.ts`
+
+**Bağımlılıklar:** STEP-10
+
+```typescript
+import { ApiProperty } from '@nestjs/swagger'
+import { IsString, MinLength, MaxLength } from 'class-validator'
+
+export class ExplainQueryDto {
+  @ApiProperty({
+    description: 'SQL query to explain',
+    example: 'SELECT TOP 10 * FROM [dbo].[Orders] WHERE [Status] = @p1',
+    minLength: 10,
+    maxLength: 10000,
+  })
+  @IsString()
+  @MinLength(10)
+  @MaxLength(10000)
+  sql!: string
+}
+```
+
+---
+
+### STEP-14: apps/api/src/modules/ai/dto/fix-query.dto.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/dto/fix-query.dto.ts`
+
+**Bağımlılıklar:** STEP-10
+
+```typescript
+import { ApiProperty } from '@nestjs/swagger'
+import { IsString, MinLength, MaxLength } from 'class-validator'
+
+export class FixQueryDto {
+  @ApiProperty({
+    description: 'The broken SQL query',
+    example: 'SELECT * FORM Orders',
+    minLength: 5,
+    maxLength: 10000,
+  })
+  @IsString()
+  @MinLength(5)
+  @MaxLength(10000)
+  sql!: string
+
+  @ApiProperty({
+    description: 'The SQL error message returned by the database',
+    example: "Incorrect syntax near 'FORM'.",
+    minLength: 1,
+    maxLength: 2000,
+  })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(2000)
+  errorMessage!: string
+}
+```
+
+---
+
+### STEP-15: apps/api/src/modules/ai/ai.service.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/ai.service.ts`
+
+**Bağımlılıklar:** STEP-07 (ai-client exports), STEP-10 (env), STEP-12, STEP-13, STEP-14
+
+Bu servis:
+1. `DataSourceService.listTables()` + `describeTable()` kullanarak şema context oluşturur
+2. `AiClient` üzerinden ilgili metodu çağırır
+3. Streaming operasyonlar için `AsyncIterable<AiStreamChunk>` döner
+
+```typescript
+import { AiClient } from '@datascriba/ai-client'
+import type { AiStreamChunk, SchemaContext } from '@datascriba/ai-client'
+import type { ExplainQueryResponse } from '@datascriba/shared-types'
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common'
+import { ConfigService } from '@nestjs/config'
+
+import type { Env } from '../../config/env'
+import { DataSourceService } from '../data-source/data-source.service'
+import type { ExplainQueryDto } from './dto/explain-query.dto'
+import type { FixQueryDto } from './dto/fix-query.dto'
+import type { SuggestQueryDto } from './dto/suggest-query.dto'
+
+@Injectable()
+export class AiService implements OnModuleInit {
+  private readonly logger = new Logger(AiService.name)
+  private client!: AiClient
+
+  constructor(
+    private readonly config: ConfigService<Env, true>,
+    private readonly dataSourceService: DataSourceService,
+  ) {}
+
+  onModuleInit(): void {
+    this.client = new AiClient({
+      apiKey: this.config.get('ANTHROPIC_API_KEY'),
+      model: this.config.get('AI_MODEL'),
+      maxTokens: 2048,
+    })
+    this.logger.log(
+      { model: this.config.get('AI_MODEL') },
+      'AiService initialized',
+    )
+  }
+
+  /**
+   * Veri kaynağının tam şemasını getirir.
+   * Tüm tablolar + her tablonun kolonları — AI prompt context'i için.
+   */
+  private async buildSchemaContext(dataSourceId: string): Promise<SchemaContext> {
+    const tables = await this.dataSourceService.listTables(dataSourceId)
+    const tablesWithColumns = await Promise.all(
+      tables.map(async (table) => {
+        const fullName = `${table.schema}.${table.name}`
+        const columns = await this.dataSourceService.describeTable(
+          dataSourceId,
+          fullName,
+        )
+        return {
+          schema: table.schema,
+          name: table.name,
+          type: table.type,
+          columns,
+        }
+      }),
+    )
+    return { dataSourceId, tables: tablesWithColumns }
+  }
+
+  /**
+   * Doğal dil prompt'tan SQL önerisi üretir.
+   * Streaming — AsyncIterable<AiStreamChunk> döner.
+   */
+  async *suggestQuery(dto: SuggestQueryDto): AsyncIterable<AiStreamChunk> {
+    this.logger.log(
+      { dataSourceId: dto.dataSourceId },
+      'AI suggest-query started',
+    )
+    const schemaContext = await this.buildSchemaContext(dto.dataSourceId)
+
+    yield* this.client.suggestQuery({
+      prompt: dto.prompt,
+      dataSourceId: dto.dataSourceId,
+      schemaContext,
+    })
+
+    this.logger.log(
+      { dataSourceId: dto.dataSourceId },
+      'AI suggest-query completed',
+    )
+  }
+
+  /**
+   * SQL sorgusunu Türkçe ve İngilizce açıklar.
+   * Non-streaming — tam yanıt döner.
+   */
+  async explainQuery(dto: ExplainQueryDto): Promise<ExplainQueryResponse> {
+    this.logger.log('AI explain-query started')
+    const result = await this.client.explainQuery({ sql: dto.sql })
+
+    const { turkish, english } = this.parseExplainResponse(result.text)
+
+    this.logger.log(
+      {
+        model: result.model,
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+        cacheReadInputTokens: result.cacheReadInputTokens,
+      },
+      'AI explain-query completed',
+    )
+
+    return { turkish, english, model: result.model }
+  }
+
+  /**
+   * Hatalı SQL'i düzeltir.
+   * Streaming — AsyncIterable<AiStreamChunk> döner.
+   */
+  async *fixQuery(dto: FixQueryDto): AsyncIterable<AiStreamChunk> {
+    this.logger.log('AI fix-query started')
+
+    yield* this.client.fixQuery({
+      sql: dto.sql,
+      errorMessage: dto.errorMessage,
+    })
+
+    this.logger.log('AI fix-query completed')
+  }
+
+  /**
+   * explain-query yanıtını ---TR--- / ---EN--- bölümlerine ayırır.
+   */
+  private parseExplainResponse(text: string): {
+    turkish: string
+    english: string
+  } {
+    const trMatch = /---TR---\s*([\s\S]*?)(?=---EN---|$)/i.exec(text)
+    const enMatch = /---EN---\s*([\s\S]*?)$/i.exec(text)
+    return {
+      turkish: trMatch?.[1]?.trim() ?? text,
+      english: enMatch?.[1]?.trim() ?? '',
+    }
+  }
+}
+```
+
+---
+
+### STEP-16: apps/api/src/modules/ai/ai.controller.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/ai.controller.ts`
+
+**Bağımlılıklar:** STEP-15
+
+**Önemli notlar:**
+- `suggest-query` ve `fix-query`: SSE endpoint (`@Sse()`), Fastify uyumlu
+- `explain-query`: Normal POST endpoint, JSON yanıt
+- `@Throttle()` decorator ile rate limit (ThrottlerGuard controller seviyesinde uygulanır)
+- SSE: `Observable<MessageEvent>` — RxJS `from()` ile `AsyncIterable` → `Observable` dönüşümü
+
+```typescript
+import type { AiStreamChunk } from '@datascriba/ai-client'
+import type { AiSseChunk, ExplainQueryResponse } from '@datascriba/shared-types'
+import {
+  Body,
+  Controller,
+  MessageEvent,
+  Post,
+  Sse,
+  UseGuards,
+} from '@nestjs/common'
+import { ThrottlerGuard } from '@nestjs/throttler'
+import {
+  ApiBody,
+  ApiOkResponse,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger'
+import { Observable, from, map } from 'rxjs'
+
+import { AiService } from './ai.service'
+import { ExplainQueryDto } from './dto/explain-query.dto'
+import { FixQueryDto } from './dto/fix-query.dto'
+import { SuggestQueryDto } from './dto/suggest-query.dto'
+
+/**
+ * AsyncIterable<AiStreamChunk> → Observable<MessageEvent> dönüştürücü.
+ * NestJS SSE (@Sse) Observable<MessageEvent> bekler.
+ */
+function chunkToSse(
+  iterable: AsyncIterable<AiStreamChunk>,
+): Observable<MessageEvent> {
+  return from(iterable).pipe(
+    map((chunk): MessageEvent => {
+      const data: AiSseChunk = {
+        type: chunk.type,
+        text: chunk.text,
+        error: chunk.error,
+      }
+      return { data }
+    }),
+  )
+}
+
+@ApiTags('AI')
+@Controller('ai')
+@UseGuards(ThrottlerGuard)
+export class AiController {
+  constructor(private readonly service: AiService) {}
+
+  @Sse('suggest-query')
+  @ApiOperation({
+    summary: 'Generate SQL from natural language (streaming SSE)',
+  })
+  @ApiBody({ type: SuggestQueryDto })
+  @ApiOkResponse({
+    description: 'Server-Sent Events stream of SQL tokens',
+  })
+  suggestQuery(@Body() dto: SuggestQueryDto): Observable<MessageEvent> {
+    return chunkToSse(this.service.suggestQuery(dto))
+  }
+
+  @Post('explain-query')
+  @ApiOperation({ summary: 'Explain a SQL query in Turkish and English' })
+  @ApiBody({ type: ExplainQueryDto })
+  @ApiOkResponse({
+    description: 'Explanation in Turkish and English',
+  })
+  async explainQuery(
+    @Body() dto: ExplainQueryDto,
+  ): Promise<ExplainQueryResponse> {
+    return this.service.explainQuery(dto)
+  }
+
+  @Sse('fix-query')
+  @ApiOperation({
+    summary: 'Fix a broken SQL query (streaming SSE)',
+  })
+  @ApiBody({ type: FixQueryDto })
+  @ApiOkResponse({
+    description: 'Server-Sent Events stream of corrected SQL tokens',
+  })
+  fixQuery(@Body() dto: FixQueryDto): Observable<MessageEvent> {
+    return chunkToSse(this.service.fixQuery(dto))
+  }
+}
+```
+
+**Mimari Not — SSE + POST uyumluluk:** NestJS `@Sse()` decorator herhangi bir HTTP metoduyla kullanılabilir. Fastify adaptörü `Content-Type: text/event-stream` header'ını NestJS SSE altyapısı otomatik set eder. Body taşımak için POST zorunludur. Eğer Fastify + SSE + POST birlikte çalışmazsa alternatif: body'yi query string'e taşı ve GET kullan (`?prompt=...&dataSourceId=...`). Builder bu durumu test ederek karar verir.
+
+---
+
+### STEP-17: apps/api/src/modules/ai/ai.module.ts
+
+**Oluşturulacak dosya:** `apps/api/src/modules/ai/ai.module.ts`
+
+**Bağımlılıklar:** STEP-15, STEP-16
+
+```typescript
+import { Module } from '@nestjs/common'
+
+import { DataSourceModule } from '../data-source/data-source.module'
+import { AiController } from './ai.controller'
+import { AiService } from './ai.service'
+
+@Module({
+  imports: [DataSourceModule],
+  controllers: [AiController],
+  providers: [AiService],
+})
+export class AiModule {}
+```
+
+---
+
+### STEP-18: apps/api/src/app.module.ts Güncellemesi
+
+**Güncellenecek dosya:** `apps/api/src/app.module.ts`
+
+**Bağımlılıklar:** STEP-11 (throttler bağımlılığı), STEP-17 (AiModule)
+
+`ThrottlerModule` ve `AiModule` eklenir.
+
+```typescript
+import { Module } from '@nestjs/common'
+import { ConfigModule, ConfigService } from '@nestjs/config'
+import { APP_FILTER } from '@nestjs/core'
+import { ThrottlerModule } from '@nestjs/throttler'
+
+import { AppController } from './app.controller'
+import { AppService } from './app.service'
+import { AppExceptionFilter } from './common/filters/app-exception.filter'
+import type { Env } from './config/env'
+import { AiModule } from './modules/ai/ai.module'
+import { DataSourceModule } from './modules/data-source/data-source.module'
+import { ReportModule } from './modules/report/report.module'
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      envFilePath: ['.env.local', '.env'],
+    }),
+    ThrottlerModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<Env, true>) => [
+        {
+          name: 'ai',
+          ttl: 60_000,
+          limit: config.get('AI_RATE_LIMIT_RPM'),
+        },
+      ],
+    }),
+    DataSourceModule,
+    ReportModule,
+    AiModule,
+  ],
+  controllers: [AppController],
+  providers: [
+    AppService,
+    {
+      provide: APP_FILTER,
+      useClass: AppExceptionFilter,
+    },
+  ],
+})
+export class AppModule {}
+```
+
+---
+
+### STEP-19: apps/api/src/common/filters/app-exception.filter.ts Güncellemesi
+
+**Güncellenecek dosya:** `apps/api/src/common/filters/app-exception.filter.ts`
+
+**Bağımlılıklar:** STEP-11
+
+`ThrottlerException` mapping eklenir. Tam güncellenmiş dosya:
+
+```typescript
+import {
+  ConnectionError,
+  DataSourceError,
+  DangerousQueryError,
+  EncryptionError,
+  QueryBlockedError,
+  QueryError,
+  UnsupportedDriverError,
+} from '@datascriba/db-drivers'
+import {
+  ParameterValidationError,
+  RenderError,
+  TemplateError,
+  UnsupportedFormatError,
+} from '@datascriba/report-engine'
+import {
+  ArgumentsHost,
+  Catch,
+  ExceptionFilter,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from '@nestjs/common'
+import { ThrottlerException } from '@nestjs/throttler'
+import type { FastifyReply, FastifyRequest } from 'fastify'
+
+interface ErrorResponse {
+  statusCode: number
+  error: string
+  message: string
+  timestamp: string
+  path: string
+}
+
+@Catch()
+export class AppExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AppExceptionFilter.name)
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const ctx = host.switchToHttp()
+    const reply = ctx.getResponse<FastifyReply>()
+    const request = ctx.getRequest<FastifyRequest>()
+
+    const { statusCode, message } = this.mapException(exception)
+
+    const body: ErrorResponse = {
+      statusCode,
+      error: HttpStatus[statusCode] ?? 'INTERNAL_SERVER_ERROR',
+      message,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+    }
+
+    if (statusCode >= 500) {
+      this.logger.error({ err: exception, path: request.url }, message)
+    } else {
+      this.logger.warn({ path: request.url }, message)
+    }
+
+    void reply.status(statusCode).send(body)
+  }
+
+  private mapException(exception: unknown): { statusCode: number; message: string } {
+    if (exception instanceof ThrottlerException) {
+      return { statusCode: 429, message: 'Too many requests. Please wait before retrying.' }
+    }
+    if (exception instanceof HttpException) {
+      return { statusCode: exception.getStatus(), message: exception.message }
+    }
+    if (exception instanceof DangerousQueryError) {
+      return { statusCode: HttpStatus.FORBIDDEN, message: exception.message }
+    }
+    if (exception instanceof QueryBlockedError) {
+      return { statusCode: HttpStatus.FORBIDDEN, message: exception.message }
+    }
+    if (exception instanceof ConnectionError) {
+      return { statusCode: 503, message: 'Data source connection failed' }
+    }
+    if (exception instanceof QueryError) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: 'Query execution failed' }
+    }
+    if (exception instanceof UnsupportedDriverError) {
+      return { statusCode: 501, message: exception.message }
+    }
+    if (exception instanceof EncryptionError) {
+      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Encryption error' }
+    }
+    if (exception instanceof DataSourceError) {
+      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Data source error' }
+    }
+    if (exception instanceof ParameterValidationError) {
+      return { statusCode: 422, message: exception.message }
+    }
+    if (exception instanceof TemplateError) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: exception.message }
+    }
+    if (exception instanceof UnsupportedFormatError) {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: exception.message }
+    }
+    if (exception instanceof RenderError) {
+      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: exception.message }
+    }
+    return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Internal server error' }
+  }
+}
+```
+
+---
+
+### STEP-20: apps/web/package.json Güncellemesi
+
+**Güncellenecek dosya:** `apps/web/package.json`
+
+**Bağımlılıklar:** Yok (frontend bağımlılık ekleme)
+
+`@radix-ui/react-collapsible` eklenir. Tam güncellenmiş `package.json`:
 
 ```json
 {
@@ -75,6 +1353,7 @@ Dosya: `apps/web/package.json`
     "clsx": "^2.1.1",
     "tailwind-merge": "^2.5.2",
     "lucide-react": "^0.447.0",
+    "@radix-ui/react-collapsible": "^1.1.1",
     "@radix-ui/react-dialog": "^1.1.2",
     "@radix-ui/react-dropdown-menu": "^2.1.2",
     "@radix-ui/react-label": "^2.1.0",
@@ -86,7 +1365,8 @@ Dosya: `apps/web/package.json`
     "@radix-ui/react-toast": "^1.2.2",
     "@radix-ui/react-tooltip": "^1.1.3",
     "@monaco-editor/react": "^4.6.0",
-    "date-fns": "^4.1.0"
+    "date-fns": "^4.1.0",
+    "@datascriba/shared-types": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -104,1737 +1384,624 @@ Dosya: `apps/web/package.json`
 
 ---
 
-### STEP-02: apps/web tsconfig.json
+### STEP-21: apps/web/src/components/ui/collapsible.tsx
 
-Dosya: `apps/web/tsconfig.json`
+**Oluşturulacak dosya:** `apps/web/src/components/ui/collapsible.tsx`
 
-```json
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["dom", "dom.iterable", "esnext"],
-    "allowJs": false,
-    "skipLibCheck": true,
-    "strict": true,
-    "noEmit": true,
-    "esModuleInterop": true,
-    "module": "esnext",
-    "moduleResolution": "bundler",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "jsx": "preserve",
-    "incremental": true,
-    "plugins": [{ "name": "next" }],
-    "paths": {
-      "@/*": ["./src/*"]
-    }
-  },
-  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
-}
-```
+**Bağımlılıklar:** STEP-20
 
----
-
-### STEP-03: apps/web next.config.ts
-
-Dosya: `apps/web/next.config.ts`
-
-```typescript
-import createNextIntlPlugin from 'next-intl/plugin'
-import type { NextConfig } from 'next'
-
-const withNextIntl = createNextIntlPlugin('./src/i18n/request.ts')
-
-const config: NextConfig = {
-  reactStrictMode: true,
-  transpilePackages: ['@datascriba/shared-types'],
-  experimental: {
-    optimizePackageImports: ['lucide-react', '@radix-ui/react-icons'],
-  },
-}
-
-export default withNextIntl(config)
-```
-
----
-
-### STEP-04: apps/web postcss.config.mjs
-
-Dosya: `apps/web/postcss.config.mjs`
-
-```javascript
-const config = {
-  plugins: {
-    '@tailwindcss/postcss': {},
-  },
-}
-
-export default config
-```
-
----
-
-### STEP-05: apps/web src/lib/utils.ts
-
-Dosya: `apps/web/src/lib/utils.ts`
-
-```typescript
-import { clsx, type ClassValue } from 'clsx'
-import { twMerge } from 'tailwind-merge'
-
-export function cn(...inputs: ClassValue[]): string {
-  return twMerge(clsx(inputs))
-}
-```
-
----
-
-### STEP-06: apps/web src/lib/env.ts
-
-Dosya: `apps/web/src/lib/env.ts`
-
-```typescript
-import { z } from 'zod'
-
-const schema = z.object({
-  NEXT_PUBLIC_API_URL: z.string().url(),
-})
-
-export const env = schema.parse({
-  NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
-})
-```
-
----
-
-### STEP-07: apps/web .env.local
-
-Dosya: `apps/web/.env.local`
-
-```
-NEXT_PUBLIC_API_URL=http://localhost:3001
-```
-
----
-
-### STEP-08: i18n — mesaj dosyaları
-
-Dosya: `apps/web/src/i18n/messages/en.json`
-
-```json
-{
-  "common": {
-    "save": "Save",
-    "cancel": "Cancel",
-    "delete": "Delete",
-    "edit": "Edit",
-    "create": "Create",
-    "loading": "Loading...",
-    "error": "Error",
-    "success": "Success",
-    "confirm": "Confirm",
-    "back": "Back",
-    "name": "Name",
-    "description": "Description",
-    "actions": "Actions",
-    "noData": "No data found",
-    "testConnection": "Test Connection",
-    "connected": "Connected",
-    "failed": "Failed"
-  },
-  "nav": {
-    "dataSources": "Data Sources",
-    "reports": "Reports",
-    "settings": "Settings"
-  },
-  "dataSource": {
-    "title": "Data Sources",
-    "createNew": "New Data Source",
-    "editTitle": "Edit Data Source",
-    "host": "Host",
-    "port": "Port",
-    "database": "Database",
-    "username": "Username",
-    "password": "Password",
-    "encrypt": "Encrypt Connection",
-    "trustServerCertificate": "Trust Server Certificate",
-    "connectionTimeout": "Connection Timeout (ms)",
-    "queryTimeout": "Query Timeout (ms)",
-    "deleteConfirm": "Are you sure you want to delete this data source?"
-  },
-  "report": {
-    "title": "Reports",
-    "createNew": "New Report",
-    "editTitle": "Edit Report",
-    "query": "SQL Query",
-    "parameters": "Parameters",
-    "exportFormats": "Export Formats",
-    "run": "Run Report",
-    "runHistory": "Run History",
-    "format": "Format",
-    "download": "Download",
-    "status": "Status",
-    "startedAt": "Started At",
-    "completedAt": "Completed At",
-    "running": "Running",
-    "completed": "Completed",
-    "failed": "Failed",
-    "addParameter": "Add Parameter",
-    "paramName": "Parameter Name",
-    "paramType": "Type",
-    "paramLabel": "Label",
-    "paramRequired": "Required",
-    "paramDefault": "Default Value"
-  }
-}
-```
-
-Dosya: `apps/web/src/i18n/messages/tr.json`
-
-```json
-{
-  "common": {
-    "save": "Kaydet",
-    "cancel": "İptal",
-    "delete": "Sil",
-    "edit": "Düzenle",
-    "create": "Oluştur",
-    "loading": "Yükleniyor...",
-    "error": "Hata",
-    "success": "Başarılı",
-    "confirm": "Onayla",
-    "back": "Geri",
-    "name": "Ad",
-    "description": "Açıklama",
-    "actions": "İşlemler",
-    "noData": "Veri bulunamadı",
-    "testConnection": "Bağlantıyı Test Et",
-    "connected": "Bağlandı",
-    "failed": "Başarısız"
-  },
-  "nav": {
-    "dataSources": "Veri Kaynakları",
-    "reports": "Raporlar",
-    "settings": "Ayarlar"
-  },
-  "dataSource": {
-    "title": "Veri Kaynakları",
-    "createNew": "Yeni Veri Kaynağı",
-    "editTitle": "Veri Kaynağını Düzenle",
-    "host": "Sunucu",
-    "port": "Port",
-    "database": "Veritabanı",
-    "username": "Kullanıcı Adı",
-    "password": "Şifre",
-    "encrypt": "Bağlantıyı Şifrele",
-    "trustServerCertificate": "Sunucu Sertifikasına Güven",
-    "connectionTimeout": "Bağlantı Zaman Aşımı (ms)",
-    "queryTimeout": "Sorgu Zaman Aşımı (ms)",
-    "deleteConfirm": "Bu veri kaynağını silmek istediğinizden emin misiniz?"
-  },
-  "report": {
-    "title": "Raporlar",
-    "createNew": "Yeni Rapor",
-    "editTitle": "Raporu Düzenle",
-    "query": "SQL Sorgusu",
-    "parameters": "Parametreler",
-    "exportFormats": "Dışa Aktarma Formatları",
-    "run": "Raporu Çalıştır",
-    "runHistory": "Çalıştırma Geçmişi",
-    "format": "Format",
-    "download": "İndir",
-    "status": "Durum",
-    "startedAt": "Başlangıç",
-    "completedAt": "Bitiş",
-    "running": "Çalışıyor",
-    "completed": "Tamamlandı",
-    "failed": "Başarısız",
-    "addParameter": "Parametre Ekle",
-    "paramName": "Parametre Adı",
-    "paramType": "Tür",
-    "paramLabel": "Etiket",
-    "paramRequired": "Zorunlu",
-    "paramDefault": "Varsayılan Değer"
-  }
-}
-```
-
----
-
-### STEP-09: i18n — request.ts ve routing
-
-Dosya: `apps/web/src/i18n/request.ts`
-
-```typescript
-import { getRequestConfig } from 'next-intl/server'
-import { routing } from './routing'
-
-export default getRequestConfig(async ({ requestLocale }) => {
-  let locale = await requestLocale
-  if (!locale || !routing.locales.includes(locale as 'en' | 'tr')) {
-    locale = routing.defaultLocale
-  }
-  return {
-    locale,
-    messages: (await import(`./messages/${locale}.json`)) as Record<string, unknown>,
-  }
-})
-```
-
-Dosya: `apps/web/src/i18n/routing.ts`
-
-```typescript
-import { defineRouting } from 'next-intl/routing'
-
-export const routing = defineRouting({
-  locales: ['en', 'tr'],
-  defaultLocale: 'en',
-})
-```
-
----
-
-### STEP-10: Middleware
-
-Dosya: `apps/web/src/middleware.ts`
-
-```typescript
-import createMiddleware from 'next-intl/middleware'
-import { routing } from './i18n/routing'
-
-export default createMiddleware(routing)
-
-export const config = {
-  matcher: ['/((?!api|_next|_vercel|.*\\..*).*)'],
-}
-```
-
----
-
-### STEP-11: API Client
-
-Dosya: `apps/web/src/lib/api-client.ts`
-
-```typescript
-import { env } from './env'
-
-class ApiError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string,
-  ) {
-    super(message)
-    this.name = 'ApiError'
-  }
-}
-
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${env.NEXT_PUBLIC_API_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
-    ...init,
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new ApiError(res.status, text)
-  }
-  if (res.status === 204) return undefined as T
-  return res.json() as Promise<T>
-}
-
-export const apiClient = {
-  get: <T>(path: string) => apiFetch<T>(path),
-  post: <T>(path: string, body: unknown) =>
-    apiFetch<T>(path, { method: 'POST', body: JSON.stringify(body) }),
-  put: <T>(path: string, body: unknown) =>
-    apiFetch<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
-  delete: <T>(path: string) => apiFetch<T>(path, { method: 'DELETE' }),
-  postRaw: (path: string, body: unknown) =>
-    fetch(`${env.NEXT_PUBLIC_API_URL}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }),
-}
-```
-
----
-
-### STEP-12: TanStack Query hooks — Data Sources
-
-Dosya: `apps/web/src/hooks/use-data-sources.ts`
-
-```typescript
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { DataSourceRecord } from '@datascriba/shared-types'
-import { apiClient } from '@/lib/api-client'
-
-const QUERY_KEY = ['dataSources'] as const
-
-interface CreateDataSourcePayload {
-  name: string
-  host: string
-  port: number
-  database: string
-  username: string
-  password: string
-  encrypt?: boolean
-  trustServerCertificate?: boolean
-  connectionTimeoutMs?: number
-  queryTimeoutMs?: number
-}
-
-export function useDataSources() {
-  return useQuery({
-    queryKey: QUERY_KEY,
-    queryFn: () => apiClient.get<DataSourceRecord[]>('/data-sources'),
-  })
-}
-
-export function useDataSource(id: string) {
-  return useQuery({
-    queryKey: [...QUERY_KEY, id],
-    queryFn: () => apiClient.get<DataSourceRecord>(`/data-sources/${id}`),
-    enabled: Boolean(id),
-  })
-}
-
-export function useCreateDataSource() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: CreateDataSourcePayload) =>
-      apiClient.post<DataSourceRecord>('/data-sources', payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useUpdateDataSource(id: string) {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: Partial<CreateDataSourcePayload>) =>
-      apiClient.put<DataSourceRecord>(`/data-sources/${id}`, payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useDeleteDataSource() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => apiClient.delete<void>(`/data-sources/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useTestDataSource() {
-  return useMutation({
-    mutationFn: (id: string) =>
-      apiClient.post<{ success: boolean; latencyMs: number }>(`/data-sources/${id}/test`, {}),
-  })
-}
-```
-
----
-
-### STEP-13: TanStack Query hooks — Reports
-
-Dosya: `apps/web/src/hooks/use-reports.ts`
-
-```typescript
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { ReportDefinition, RunRecord } from '@datascriba/shared-types'
-import { apiClient } from '@/lib/api-client'
-
-const QUERY_KEY = ['reports'] as const
-
-interface ReportParameterPayload {
-  name: string
-  type: string
-  label: string
-  required: boolean
-  defaultValue?: unknown
-  options?: Array<{ label: string; value: unknown }>
-  dependsOn?: string[]
-}
-
-interface CreateReportPayload {
-  name: string
-  dataSourceId: string
-  query: string
-  description?: string
-  parameters?: ReportParameterPayload[]
-  exportFormats: string[]
-}
-
-interface RunReportPayload {
-  format: 'csv' | 'excel'
-  parameters?: Record<string, unknown>
-}
-
-export function useReports() {
-  return useQuery({
-    queryKey: QUERY_KEY,
-    queryFn: () => apiClient.get<ReportDefinition[]>('/reports'),
-  })
-}
-
-export function useReport(id: string) {
-  return useQuery({
-    queryKey: [...QUERY_KEY, id],
-    queryFn: () => apiClient.get<ReportDefinition>(`/reports/${id}`),
-    enabled: Boolean(id),
-  })
-}
-
-export function useCreateReport() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: CreateReportPayload) =>
-      apiClient.post<ReportDefinition>('/reports', payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useUpdateReport(id: string) {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: Partial<CreateReportPayload>) =>
-      apiClient.put<ReportDefinition>(`/reports/${id}`, payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useDeleteReport() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => apiClient.delete<void>(`/reports/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useRunReport() {
-  return useMutation({
-    mutationFn: ({ id, payload }: { id: string; payload: RunReportPayload }) =>
-      apiClient.postRaw(`/reports/${id}/run`, payload),
-  })
-}
-
-export function useReportRuns(reportId: string) {
-  return useQuery({
-    queryKey: [...QUERY_KEY, reportId, 'runs'],
-    queryFn: () => apiClient.get<RunRecord[]>(`/reports/${reportId}/runs`),
-    enabled: Boolean(reportId),
-  })
-}
-```
-
----
-
-### STEP-14: Zustand Editor Store
-
-Dosya: `apps/web/src/store/report-editor.store.ts`
-
-```typescript
-import { temporal } from 'zundo'
-import { create } from 'zustand'
-
-interface ReportParameter {
-  id: string
-  name: string
-  type: string
-  label: string
-  required: boolean
-  defaultValue?: unknown
-  options?: Array<{ label: string; value: unknown }>
-}
-
-interface ReportEditorState {
-  reportId: string | null
-  name: string
-  description: string
-  dataSourceId: string
-  query: string
-  parameters: ReportParameter[]
-  exportFormats: string[]
-  isDirty: boolean
-
-  setField: <K extends keyof Omit<ReportEditorState, 'setField' | 'addParameter' | 'removeParameter' | 'reorderParameters' | 'resetDirty' | 'loadReport' | 'isDirty'>>(
-    key: K,
-    value: ReportEditorState[K],
-  ) => void
-  addParameter: (param: ReportParameter) => void
-  removeParameter: (id: string) => void
-  reorderParameters: (from: number, to: number) => void
-  resetDirty: () => void
-  loadReport: (report: {
-    id: string
-    name: string
-    description?: string
-    dataSourceId: string
-    query: string
-    parameters: ReportParameter[]
-    exportFormats: string[]
-  }) => void
-}
-
-export const useReportEditorStore = create<ReportEditorState>()(
-  temporal((set) => ({
-    reportId: null,
-    name: '',
-    description: '',
-    dataSourceId: '',
-    query: '',
-    parameters: [],
-    exportFormats: ['csv'],
-    isDirty: false,
-
-    setField: (key, value) =>
-      set((state) => ({ ...state, [key]: value, isDirty: true })),
-
-    addParameter: (param) =>
-      set((state) => ({
-        parameters: [...state.parameters, param],
-        isDirty: true,
-      })),
-
-    removeParameter: (id) =>
-      set((state) => ({
-        parameters: state.parameters.filter((p) => p.id !== id),
-        isDirty: true,
-      })),
-
-    reorderParameters: (from, to) =>
-      set((state) => {
-        const params = [...state.parameters]
-        const [moved] = params.splice(from, 1)
-        params.splice(to, 0, moved!)
-        return { parameters: params, isDirty: true }
-      }),
-
-    resetDirty: () => set((state) => ({ ...state, isDirty: false })),
-
-    loadReport: (report) =>
-      set({
-        reportId: report.id,
-        name: report.name,
-        description: report.description ?? '',
-        dataSourceId: report.dataSourceId,
-        query: report.query,
-        parameters: report.parameters,
-        exportFormats: report.exportFormats,
-        isDirty: false,
-      }),
-  })),
-)
-```
-
----
-
-### STEP-15: TailwindCSS globals.css
-
-Dosya: `apps/web/src/app/globals.css`
-
-```css
-@import "tailwindcss";
-
-@layer base {
-  :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 238.7 83.5% 66.7%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 238.7 83.5% 66.7%;
-    --radius: 0.5rem;
-  }
-
-  .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 238.7 83.5% 66.7%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 238.7 83.5% 66.7%;
-  }
-
-  * {
-    border-color: hsl(var(--border));
-  }
-
-  body {
-    background-color: hsl(var(--background));
-    color: hsl(var(--foreground));
-    font-family: Inter, system-ui, sans-serif;
-  }
-}
-```
-
----
-
-### STEP-16: shadcn/ui temel bileşenler
-
-**STEP-16a:** `apps/web/src/components/ui/button.tsx`
-
-```tsx
-import { Slot } from '@radix-ui/react-slot'
-import { cva, type VariantProps } from 'class-variance-authority'
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-const buttonVariants = cva(
-  'inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium ring-offset-background transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50',
-  {
-    variants: {
-      variant: {
-        default: 'bg-primary text-primary-foreground hover:bg-primary/90',
-        destructive: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
-        outline: 'border border-input bg-background hover:bg-accent hover:text-accent-foreground',
-        secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/80',
-        ghost: 'hover:bg-accent hover:text-accent-foreground',
-        link: 'text-primary underline-offset-4 hover:underline',
-      },
-      size: {
-        default: 'h-10 px-4 py-2',
-        sm: 'h-9 rounded-md px-3',
-        lg: 'h-11 rounded-md px-8',
-        icon: 'h-10 w-10',
-      },
-    },
-    defaultVariants: { variant: 'default', size: 'default' },
-  },
-)
-
-interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
-    VariantProps<typeof buttonVariants> {
-  asChild?: boolean
-}
-
-export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant, size, asChild = false, ...props }, ref) => {
-    const Comp = asChild ? Slot : 'button'
-    return <Comp className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props} />
-  },
-)
-Button.displayName = 'Button'
-```
-
-**STEP-16b:** `apps/web/src/components/ui/input.tsx`
-
-```tsx
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-export interface InputProps extends React.InputHTMLAttributes<HTMLInputElement> {}
-
-export const Input = React.forwardRef<HTMLInputElement, InputProps>(
-  ({ className, type, ...props }, ref) => (
-    <input
-      type={type}
-      className={cn(
-        'flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50',
-        className,
-      )}
-      ref={ref}
-      {...props}
-    />
-  ),
-)
-Input.displayName = 'Input'
-```
-
-**STEP-16c:** `apps/web/src/components/ui/label.tsx`
+shadcn/ui pattern'ine uygun Radix Collapsible wrapper:
 
 ```tsx
 'use client'
-import * as LabelPrimitive from '@radix-ui/react-label'
-import { cva, type VariantProps } from 'class-variance-authority'
+
+import * as CollapsiblePrimitive from '@radix-ui/react-collapsible'
+
+const Collapsible = CollapsiblePrimitive.Root
+const CollapsibleTrigger = CollapsiblePrimitive.CollapsibleTrigger
+const CollapsibleContent = CollapsiblePrimitive.CollapsibleContent
+
+export { Collapsible, CollapsibleTrigger, CollapsibleContent }
+```
+
+---
+
+### STEP-22: apps/web/src/components/ui/tabs.tsx
+
+**Oluşturulacak dosya:** `apps/web/src/components/ui/tabs.tsx`
+
+**Bağımlılıklar:** `@radix-ui/react-tabs` (zaten `web/package.json`'da var)
+
+shadcn/ui pattern'ine uygun Tabs bileşeni:
+
+```tsx
+'use client'
+
+import * as TabsPrimitive from '@radix-ui/react-tabs'
 import * as React from 'react'
+
 import { cn } from '@/lib/utils'
 
-const labelVariants = cva(
-  'text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70',
-)
+const Tabs = TabsPrimitive.Root
 
-export const Label = React.forwardRef<
-  React.ElementRef<typeof LabelPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof LabelPrimitive.Root> & VariantProps<typeof labelVariants>
+const TabsList = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.List>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.List>
 >(({ className, ...props }, ref) => (
-  <LabelPrimitive.Root ref={ref} className={cn(labelVariants(), className)} {...props} />
-))
-Label.displayName = LabelPrimitive.Root.displayName
-```
-
-**STEP-16d:** `apps/web/src/components/ui/select.tsx`
-
-```tsx
-'use client'
-import * as SelectPrimitive from '@radix-ui/react-select'
-import { Check, ChevronDown } from 'lucide-react'
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-export const Select = SelectPrimitive.Root
-export const SelectGroup = SelectPrimitive.Group
-export const SelectValue = SelectPrimitive.Value
-
-export const SelectTrigger = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Trigger>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Trigger>
->(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Trigger
+  <TabsPrimitive.List
     ref={ref}
     className={cn(
-      'flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50',
+      'inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground',
       className,
     )}
-    {...props}
-  >
-    {children}
-    <SelectPrimitive.Icon asChild>
-      <ChevronDown className="h-4 w-4 opacity-50" />
-    </SelectPrimitive.Icon>
-  </SelectPrimitive.Trigger>
-))
-SelectTrigger.displayName = SelectPrimitive.Trigger.displayName
-
-export const SelectContent = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
->(({ className, children, position = 'popper', ...props }, ref) => (
-  <SelectPrimitive.Portal>
-    <SelectPrimitive.Content
-      ref={ref}
-      className={cn(
-        'relative z-50 min-w-[8rem] overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md',
-        position === 'popper' && 'translate-y-1',
-        className,
-      )}
-      position={position}
-      {...props}
-    >
-      <SelectPrimitive.Viewport className="p-1">{children}</SelectPrimitive.Viewport>
-    </SelectPrimitive.Content>
-  </SelectPrimitive.Portal>
-))
-SelectContent.displayName = SelectPrimitive.Content.displayName
-
-export const SelectItem = React.forwardRef<
-  React.ElementRef<typeof SelectPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
->(({ className, children, ...props }, ref) => (
-  <SelectPrimitive.Item
-    ref={ref}
-    className={cn(
-      'relative flex w-full cursor-default select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
-      className,
-    )}
-    {...props}
-  >
-    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
-      <SelectPrimitive.ItemIndicator>
-        <Check className="h-4 w-4" />
-      </SelectPrimitive.ItemIndicator>
-    </span>
-    <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
-  </SelectPrimitive.Item>
-))
-SelectItem.displayName = SelectPrimitive.Item.displayName
-```
-
-**STEP-16e:** `apps/web/src/components/ui/badge.tsx`
-
-```tsx
-import { cva, type VariantProps } from 'class-variance-authority'
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-const badgeVariants = cva(
-  'inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors',
-  {
-    variants: {
-      variant: {
-        default: 'border-transparent bg-primary text-primary-foreground',
-        secondary: 'border-transparent bg-secondary text-secondary-foreground',
-        destructive: 'border-transparent bg-destructive text-destructive-foreground',
-        outline: 'text-foreground',
-        success: 'border-transparent bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-100',
-        warning: 'border-transparent bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-100',
-      },
-    },
-    defaultVariants: { variant: 'default' },
-  },
-)
-
-export interface BadgeProps
-  extends React.HTMLAttributes<HTMLDivElement>,
-    VariantProps<typeof badgeVariants> {}
-
-export function Badge({ className, variant, ...props }: BadgeProps) {
-  return <div className={cn(badgeVariants({ variant }), className)} {...props} />
-}
-```
-
-**STEP-16f:** `apps/web/src/components/ui/card.tsx`
-
-```tsx
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-export const Card = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div
-      ref={ref}
-      className={cn('rounded-lg border bg-card text-card-foreground shadow-sm', className)}
-      {...props}
-    />
-  ),
-)
-Card.displayName = 'Card'
-
-export const CardHeader = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn('flex flex-col space-y-1.5 p-6', className)} {...props} />
-  ),
-)
-CardHeader.displayName = 'CardHeader'
-
-export const CardTitle = React.forwardRef<HTMLParagraphElement, React.HTMLAttributes<HTMLHeadingElement>>(
-  ({ className, ...props }, ref) => (
-    <h3 ref={ref} className={cn('text-2xl font-semibold leading-none tracking-tight', className)} {...props} />
-  ),
-)
-CardTitle.displayName = 'CardTitle'
-
-export const CardContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn('p-6 pt-0', className)} {...props} />
-  ),
-)
-CardContent.displayName = 'CardContent'
-
-export const CardFooter = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDivElement>>(
-  ({ className, ...props }, ref) => (
-    <div ref={ref} className={cn('flex items-center p-6 pt-0', className)} {...props} />
-  ),
-)
-CardFooter.displayName = 'CardFooter'
-```
-
-**STEP-16g:** `apps/web/src/components/ui/dialog.tsx`
-
-```tsx
-'use client'
-import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { X } from 'lucide-react'
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-export const Dialog = DialogPrimitive.Root
-export const DialogTrigger = DialogPrimitive.Trigger
-export const DialogPortal = DialogPrimitive.Portal
-
-export const DialogOverlay = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Overlay>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
->(({ className, ...props }, ref) => (
-  <DialogPrimitive.Overlay
-    ref={ref}
-    className={cn('fixed inset-0 z-50 bg-black/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0', className)}
     {...props}
   />
 ))
-DialogOverlay.displayName = DialogPrimitive.Overlay.displayName
+TabsList.displayName = TabsPrimitive.List.displayName
 
-export const DialogContent = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Content>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>
->(({ className, children, ...props }, ref) => (
-  <DialogPortal>
-    <DialogOverlay />
-    <DialogPrimitive.Content
-      ref={ref}
-      className={cn(
-        'fixed left-[50%] top-[50%] z-50 grid w-full max-w-lg translate-x-[-50%] translate-y-[-50%] gap-4 border bg-background p-6 shadow-lg sm:rounded-lg',
-        className,
-      )}
-      {...props}
-    >
-      {children}
-      <DialogPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 hover:opacity-100">
-        <X className="h-4 w-4" />
-        <span className="sr-only">Close</span>
-      </DialogPrimitive.Close>
-    </DialogPrimitive.Content>
-  </DialogPortal>
-))
-DialogContent.displayName = DialogPrimitive.Content.displayName
-
-export const DialogHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
-  <div className={cn('flex flex-col space-y-1.5 text-center sm:text-left', className)} {...props} />
-)
-
-export const DialogTitle = React.forwardRef<
-  React.ElementRef<typeof DialogPrimitive.Title>,
-  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
+const TabsTrigger = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.Trigger>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Trigger>
 >(({ className, ...props }, ref) => (
-  <DialogPrimitive.Title ref={ref} className={cn('text-lg font-semibold', className)} {...props} />
-))
-DialogTitle.displayName = DialogPrimitive.Title.displayName
-```
-
-**STEP-16h:** `apps/web/src/components/ui/switch.tsx`
-
-```tsx
-'use client'
-import * as SwitchPrimitive from '@radix-ui/react-switch'
-import * as React from 'react'
-import { cn } from '@/lib/utils'
-
-export const Switch = React.forwardRef<
-  React.ElementRef<typeof SwitchPrimitive.Root>,
-  React.ComponentPropsWithoutRef<typeof SwitchPrimitive.Root>
->(({ className, ...props }, ref) => (
-  <SwitchPrimitive.Root
+  <TabsPrimitive.Trigger
+    ref={ref}
     className={cn(
-      'peer inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input',
+      'inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow',
       className,
     )}
-    ref={ref}
     {...props}
-  >
-    <SwitchPrimitive.Thumb
-      className={cn(
-        'pointer-events-none block h-5 w-5 rounded-full bg-background shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-5 data-[state=unchecked]:translate-x-0',
-      )}
-    />
-  </SwitchPrimitive.Root>
+  />
 ))
-Switch.displayName = SwitchPrimitive.Root.displayName
+TabsTrigger.displayName = TabsPrimitive.Trigger.displayName
+
+const TabsContent = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Content>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Content
+    ref={ref}
+    className={cn(
+      'mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
+      className,
+    )}
+    {...props}
+  />
+))
+TabsContent.displayName = TabsPrimitive.Content.displayName
+
+export { Tabs, TabsList, TabsTrigger, TabsContent }
 ```
 
 ---
 
-### STEP-17: Providers
+### STEP-23: apps/web/src/hooks/use-ai.ts
 
-Dosya: `apps/web/src/components/providers.tsx`
+**Oluşturulacak dosya:** `apps/web/src/hooks/use-ai.ts`
 
-```tsx
+**Bağımlılıklar:** STEP-08 (shared-types/ai.ts), STEP-09 (shared-types index)
+
+```typescript
 'use client'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { ReactQueryDevtools } from '@tanstack/react-query-devtools'
-import { ThemeProvider } from 'next-themes'
-import * as React from 'react'
 
-function makeQueryClient(): QueryClient {
-  return new QueryClient({
-    defaultOptions: {
-      queries: { staleTime: 60 * 1000, retry: 1 },
-    },
-  })
+import type {
+  AiSseChunk,
+  ExplainQueryBody,
+  ExplainQueryResponse,
+  FixQueryBody,
+  SuggestQueryBody,
+} from '@datascriba/shared-types'
+import { useCallback, useState } from 'react'
+
+import { env } from '@/lib/env'
+
+interface StreamState {
+  text: string
+  isStreaming: boolean
+  error: string | null
 }
 
-let browserQueryClient: QueryClient | undefined
-
-function getQueryClient(): QueryClient {
-  if (typeof window === 'undefined') return makeQueryClient()
-  if (!browserQueryClient) browserQueryClient = makeQueryClient()
-  return browserQueryClient
+const INITIAL_STREAM_STATE: StreamState = {
+  text: '',
+  isStreaming: false,
+  error: null,
 }
 
-interface ProvidersProps {
-  children: React.ReactNode
-}
-
-export function Providers({ children }: ProvidersProps) {
-  const qc = getQueryClient()
-  return (
-    <QueryClientProvider client={qc}>
-      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-        {children}
-        <ReactQueryDevtools initialIsOpen={false} />
-      </ThemeProvider>
-    </QueryClientProvider>
-  )
-}
-```
-
----
-
-### STEP-18: Sidebar Navigation
-
-Dosya: `apps/web/src/components/layout/sidebar.tsx`
-
-```tsx
-'use client'
-import { Database, FileText, Settings } from 'lucide-react'
-import { useTranslations } from 'next-intl'
-import Link from 'next/link'
-import { usePathname } from 'next/navigation'
-import { cn } from '@/lib/utils'
-
-const navItems = [
-  { href: '/data-sources', icon: Database, labelKey: 'dataSources' },
-  { href: '/reports', icon: FileText, labelKey: 'reports' },
-  { href: '/settings', icon: Settings, labelKey: 'settings' },
-] as const
-
-export function Sidebar() {
-  const t = useTranslations('nav')
-  const pathname = usePathname()
-
-  return (
-    <aside className="flex h-screen w-64 flex-col border-r bg-card">
-      <div className="flex h-16 items-center border-b px-6">
-        <span className="text-xl font-bold tracking-tight text-primary">DataScriba</span>
-      </div>
-      <nav className="flex-1 space-y-1 p-4">
-        {navItems.map(({ href, icon: Icon, labelKey }) => {
-          const active = pathname.includes(href)
-          return (
-            <Link
-              key={href}
-              href={href}
-              className={cn(
-                'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors',
-                active
-                  ? 'bg-primary/10 text-primary'
-                  : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-              )}
-            >
-              <Icon className="h-4 w-4" />
-              {t(labelKey)}
-            </Link>
-          )
-        })}
-      </nav>
-    </aside>
-  )
-}
-```
-
----
-
-### STEP-19: Header
-
-Dosya: `apps/web/src/components/layout/header.tsx`
-
-```tsx
-'use client'
-import { Moon, Sun } from 'lucide-react'
-import { useTheme } from 'next-themes'
-import { useLocale } from 'next-intl'
-import { useRouter, usePathname } from 'next/navigation'
-import { Button } from '@/components/ui/button'
-
-export function Header() {
-  const { theme, setTheme } = useTheme()
-  const locale = useLocale()
-  const router = useRouter()
-  const pathname = usePathname()
-
-  function toggleLocale() {
-    const next = locale === 'en' ? 'tr' : 'en'
-    const segments = pathname.split('/')
-    segments[1] = next
-    router.push(segments.join('/'))
+/**
+ * SSE stream okuyan generic yardımcı.
+ * `onChunk` her delta'da, `onDone` tamamlanınca çağrılır.
+ */
+async function readSseStream(
+  url: string,
+  body: unknown,
+  onChunk: (text: string) => void,
+  onDone: () => void,
+  onError: (err: string) => void,
+): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch(`${env.NEXT_PUBLIC_API_URL}${url}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(body),
+    })
+  } catch {
+    onError('Network error. Please check your connection.')
+    return
   }
 
-  return (
-    <header className="flex h-16 items-center justify-end border-b bg-card px-6 gap-2">
-      <Button variant="ghost" size="icon" onClick={toggleLocale}>
-        <span className="text-xs font-bold">{locale.toUpperCase()}</span>
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon"
-        onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-      >
-        {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-      </Button>
-    </header>
-  )
-}
-```
-
----
-
-### STEP-20: Root layout (locale-aware)
-
-Dosya: `apps/web/src/app/[locale]/layout.tsx`
-
-```tsx
-import { NextIntlClientProvider } from 'next-intl'
-import { getMessages } from 'next-intl/server'
-import type { Metadata } from 'next'
-import { Providers } from '@/components/providers'
-import { Sidebar } from '@/components/layout/sidebar'
-import { Header } from '@/components/layout/header'
-import '../globals.css'
-
-export const metadata: Metadata = {
-  title: 'DataScriba',
-  description: 'AI-powered reporting platform',
-}
-
-interface LocaleLayoutProps {
-  children: React.ReactNode
-  params: Promise<{ locale: string }>
-}
-
-export default async function LocaleLayout({ children, params }: LocaleLayoutProps) {
-  const { locale } = await params
-  const messages = await getMessages()
-
-  return (
-    <html lang={locale} suppressHydrationWarning>
-      <body>
-        <NextIntlClientProvider messages={messages}>
-          <Providers>
-            <div className="flex h-screen overflow-hidden">
-              <Sidebar />
-              <div className="flex flex-1 flex-col overflow-hidden">
-                <Header />
-                <main className="flex-1 overflow-auto p-6">{children}</main>
-              </div>
-            </div>
-          </Providers>
-        </NextIntlClientProvider>
-      </body>
-    </html>
-  )
-}
-```
-
----
-
-### STEP-21: Root redirect page
-
-Dosya: `apps/web/src/app/[locale]/page.tsx`
-
-```tsx
-import { redirect } from 'next/navigation'
-import { useLocale } from 'next-intl'
-
-export default function HomePage() {
-  redirect('/reports')
-}
-```
-
-Dosya: `apps/web/src/app/page.tsx`
-
-```tsx
-import { redirect } from 'next/navigation'
-
-export default function RootPage() {
-  redirect('/en/reports')
-}
-```
-
----
-
-### STEP-22: Data Sources list page
-
-Dosya: `apps/web/src/app/[locale]/data-sources/page.tsx`
-
-```tsx
-import { useTranslations } from 'next-intl'
-import { DataSourcesClient } from './data-sources-client'
-
-export default function DataSourcesPage() {
-  const t = useTranslations('dataSource')
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{t('title')}</h1>
-      <DataSourcesClient />
-    </div>
-  )
-}
-```
-
-Dosya: `apps/web/src/app/[locale]/data-sources/data-sources-client.tsx`
-
-```tsx
-'use client'
-import { Plus, Trash2, Wifi } from 'lucide-react'
-import { useTranslations } from 'next-intl'
-import { useState } from 'react'
-import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { useDataSources, useDeleteDataSource, useTestDataSource } from '@/hooks/use-data-sources'
-import { DataSourceDialog } from './data-source-dialog'
-
-export function DataSourcesClient() {
-  const t = useTranslations()
-  const { data: sources, isLoading } = useDataSources()
-  const deleteSource = useDeleteDataSource()
-  const testSource = useTestDataSource()
-  const [testResults, setTestResults] = useState<Record<string, boolean>>({})
-  const [dialogOpen, setDialogOpen] = useState(false)
-
-  async function handleTest(id: string) {
-    const result = await testSource.mutateAsync(id)
-    setTestResults((prev) => ({ ...prev, [id]: result.success }))
+  if (!response.ok) {
+    const text = await response.text().catch(() => 'Unknown error')
+    onError(`API error ${response.status}: ${text}`)
+    return
   }
 
-  if (isLoading) return <p className="text-muted-foreground">{t('common.loading')}</p>
-
-  return (
-    <>
-      <div className="flex justify-end">
-        <Button onClick={() => setDialogOpen(true)}>
-          <Plus className="mr-2 h-4 w-4" />
-          {t('dataSource.createNew')}
-        </Button>
-      </div>
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {sources?.map((source) => (
-          <Card key={source.id}>
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">{source.name}</CardTitle>
-                {testResults[source.id] !== undefined && (
-                  <Badge variant={testResults[source.id] ? 'success' : 'destructive'}>
-                    {testResults[source.id] ? t('common.connected') : t('common.failed')}
-                  </Badge>
-                )}
-              </div>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                {source.host}:{source.port}/{source.database}
-              </p>
-              <div className="mt-3 flex gap-2">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => handleTest(source.id)}
-                  disabled={testSource.isPending}
-                >
-                  <Wifi className="mr-1 h-3 w-3" />
-                  {t('common.testConnection')}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  onClick={() => deleteSource.mutate(source.id)}
-                  disabled={deleteSource.isPending}
-                >
-                  <Trash2 className="mr-1 h-3 w-3" />
-                  {t('common.delete')}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-        {sources?.length === 0 && (
-          <p className="col-span-full text-muted-foreground">{t('common.noData')}</p>
-        )}
-      </div>
-      <DataSourceDialog open={dialogOpen} onOpenChange={setDialogOpen} />
-    </>
-  )
-}
-```
-
----
-
-### STEP-23: Data Source dialog (create/edit)
-
-Dosya: `apps/web/src/app/[locale]/data-sources/data-source-dialog.tsx`
-
-```tsx
-'use client'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useTranslations } from 'next-intl'
-import { useForm } from 'react-hook-form'
-import { z } from 'zod'
-import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
-import { useCreateDataSource } from '@/hooks/use-data-sources'
-
-const schema = z.object({
-  name: z.string().min(1),
-  host: z.string().min(1),
-  port: z.coerce.number().int().min(1).max(65535).default(1433),
-  database: z.string().min(1),
-  username: z.string().min(1),
-  password: z.string().min(1),
-  encrypt: z.boolean().default(true),
-  trustServerCertificate: z.boolean().default(false),
-  connectionTimeoutMs: z.coerce.number().default(30000),
-  queryTimeoutMs: z.coerce.number().default(60000),
-})
-
-type FormValues = z.infer<typeof schema>
-
-interface DataSourceDialogProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}
-
-export function DataSourceDialog({ open, onOpenChange }: DataSourceDialogProps) {
-  const t = useTranslations('dataSource')
-  const tc = useTranslations('common')
-  const create = useCreateDataSource()
-
-  const form = useForm<FormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: {
-      port: 1433,
-      encrypt: true,
-      trustServerCertificate: false,
-      connectionTimeoutMs: 30000,
-      queryTimeoutMs: 60000,
-    },
-  })
-
-  async function onSubmit(values: FormValues) {
-    await create.mutateAsync(values)
-    form.reset()
-    onOpenChange(false)
+  const reader = response.body?.getReader()
+  if (!reader) {
+    onError('Response body is not readable.')
+    return
   }
 
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{t('createNew')}</DialogTitle>
-        </DialogHeader>
-        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="col-span-2 space-y-1">
-              <Label>{tc('name')}</Label>
-              <Input {...form.register('name')} />
-            </div>
-            <div className="space-y-1">
-              <Label>{t('host')}</Label>
-              <Input {...form.register('host')} />
-            </div>
-            <div className="space-y-1">
-              <Label>{t('port')}</Label>
-              <Input type="number" {...form.register('port')} />
-            </div>
-            <div className="col-span-2 space-y-1">
-              <Label>{t('database')}</Label>
-              <Input {...form.register('database')} />
-            </div>
-            <div className="space-y-1">
-              <Label>{t('username')}</Label>
-              <Input {...form.register('username')} />
-            </div>
-            <div className="space-y-1">
-              <Label>{t('password')}</Label>
-              <Input type="password" {...form.register('password')} />
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={form.watch('encrypt')}
-                onCheckedChange={(v) => form.setValue('encrypt', v)}
-              />
-              <Label>{t('encrypt')}</Label>
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                checked={form.watch('trustServerCertificate')}
-                onCheckedChange={(v) => form.setValue('trustServerCertificate', v)}
-              />
-              <Label>{t('trustServerCertificate')}</Label>
-            </div>
-          </div>
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {tc('cancel')}
-            </Button>
-            <Button type="submit" disabled={create.isPending}>
-              {tc('save')}
-            </Button>
-          </div>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-```
+  const decoder = new TextDecoder()
+  let buffer = ''
 
----
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
 
-### STEP-24: Reports list page
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      // Son satır incomplete olabilir — buffer'a geri al
+      buffer = lines.pop() ?? ''
 
-Dosya: `apps/web/src/app/[locale]/reports/page.tsx`
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        const raw = line.slice(5).trim()
+        if (!raw) continue
 
-```tsx
-import { useTranslations } from 'next-intl'
-import { ReportsClient } from './reports-client'
+        let chunk: AiSseChunk
+        try {
+          chunk = JSON.parse(raw) as AiSseChunk
+        } catch {
+          continue
+        }
 
-export default function ReportsPage() {
-  const t = useTranslations('report')
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{t('title')}</h1>
-      <ReportsClient />
-    </div>
-  )
-}
-```
-
-Dosya: `apps/web/src/app/[locale]/reports/reports-client.tsx`
-
-```tsx
-'use client'
-import { Plus, Play, Trash2, Clock } from 'lucide-react'
-import { useTranslations } from 'next-intl'
-import Link from 'next/link'
-import { useState } from 'react'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { useReports, useDeleteReport } from '@/hooks/use-reports'
-import { RunReportDialog } from './run-report-dialog'
-
-export function ReportsClient() {
-  const t = useTranslations()
-  const { data: reports, isLoading } = useReports()
-  const deleteReport = useDeleteReport()
-  const [runDialogReportId, setRunDialogReportId] = useState<string | null>(null)
-
-  if (isLoading) return <p className="text-muted-foreground">{t('common.loading')}</p>
-
-  return (
-    <>
-      <div className="flex justify-end">
-        <Button asChild>
-          <Link href="/reports/new">
-            <Plus className="mr-2 h-4 w-4" />
-            {t('report.createNew')}
-          </Link>
-        </Button>
-      </div>
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-        {reports?.map((report) => (
-          <Card key={report.id}>
-            <CardHeader className="pb-2">
-              <div className="flex items-center justify-between">
-                <CardTitle className="text-base">{report.name}</CardTitle>
-                <div className="flex gap-1">
-                  {report.exportFormats.map((f) => (
-                    <Badge key={f} variant="secondary" className="text-xs">{f}</Badge>
-                  ))}
-                </div>
-              </div>
-              {report.description && (
-                <p className="text-sm text-muted-foreground">{report.description}</p>
-              )}
-            </CardHeader>
-            <CardContent>
-              <div className="flex gap-2 flex-wrap">
-                <Button size="sm" onClick={() => setRunDialogReportId(report.id)}>
-                  <Play className="mr-1 h-3 w-3" />
-                  {t('report.run')}
-                </Button>
-                <Button size="sm" variant="outline" asChild>
-                  <Link href={`/reports/${report.id}/edit`}>
-                    {t('common.edit')}
-                  </Link>
-                </Button>
-                <Button size="sm" variant="outline" asChild>
-                  <Link href={`/reports/${report.id}/runs`}>
-                    <Clock className="mr-1 h-3 w-3" />
-                    {t('report.runHistory')}
-                  </Link>
-                </Button>
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  onClick={() => deleteReport.mutate(report.id)}
-                  disabled={deleteReport.isPending}
-                >
-                  <Trash2 className="mr-1 h-3 w-3" />
-                  {t('common.delete')}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-        {reports?.length === 0 && (
-          <p className="col-span-full text-muted-foreground">{t('common.noData')}</p>
-        )}
-      </div>
-      {runDialogReportId && (
-        <RunReportDialog
-          reportId={runDialogReportId}
-          open={Boolean(runDialogReportId)}
-          onOpenChange={(open) => { if (!open) setRunDialogReportId(null) }}
-        />
-      )}
-    </>
-  )
-}
-```
-
----
-
-### STEP-25: Run Report Dialog
-
-Dosya: `apps/web/src/app/[locale]/reports/run-report-dialog.tsx`
-
-```tsx
-'use client'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { useTranslations } from 'next-intl'
-import { useForm } from 'react-hook-form'
-import { z } from 'zod'
-import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Label } from '@/components/ui/label'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { useRunReport } from '@/hooks/use-reports'
-
-const schema = z.object({
-  format: z.enum(['csv', 'excel']),
-})
-
-type FormValues = z.infer<typeof schema>
-
-interface RunReportDialogProps {
-  reportId: string
-  open: boolean
-  onOpenChange: (open: boolean) => void
-}
-
-export function RunReportDialog({ reportId, open, onOpenChange }: RunReportDialogProps) {
-  const t = useTranslations('report')
-  const tc = useTranslations('common')
-  const runReport = useRunReport()
-
-  const form = useForm<FormValues>({
-    resolver: zodResolver(schema),
-    defaultValues: { format: 'csv' },
-  })
-
-  async function onSubmit(values: FormValues) {
-    const res = await runReport.mutateAsync({ id: reportId, payload: { format: values.format } })
-    if (res.ok) {
-      const blob = await res.blob()
-      const disposition = res.headers.get('Content-Disposition') ?? ''
-      const match = /filename="([^"]+)"/.exec(disposition)
-      const filename = match?.[1] ?? `report.${values.format === 'excel' ? 'xlsx' : 'csv'}`
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = decodeURIComponent(filename)
-      a.click()
-      URL.revokeObjectURL(url)
-      onOpenChange(false)
+        if (chunk.type === 'delta' && chunk.text) {
+          onChunk(chunk.text)
+        } else if (chunk.type === 'done') {
+          onDone()
+        } else if (chunk.type === 'error') {
+          onError(chunk.error ?? 'Unknown stream error')
+        }
+      }
     }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+/**
+ * Doğal dil -> SQL öneri hook'u.
+ * Streaming SSE ile karakter karakter gösterim.
+ */
+export function useSuggestQuery(): {
+  suggest: (body: SuggestQueryBody) => Promise<void>
+  state: StreamState
+  reset: () => void
+} {
+  const [state, setState] = useState<StreamState>(INITIAL_STREAM_STATE)
+
+  const reset = useCallback(() => setState(INITIAL_STREAM_STATE), [])
+
+  const suggest = useCallback(async (body: SuggestQueryBody): Promise<void> => {
+    setState({ text: '', isStreaming: true, error: null })
+
+    await readSseStream(
+      '/api/v1/ai/suggest-query',
+      body,
+      (chunk) => setState((prev) => ({ ...prev, text: prev.text + chunk })),
+      () => setState((prev) => ({ ...prev, isStreaming: false })),
+      (err) => setState({ text: '', isStreaming: false, error: err }),
+    )
+  }, [])
+
+  return { suggest, state, reset }
+}
+
+/**
+ * SQL açıklama hook'u.
+ * Non-streaming, tek seferlik yanıt.
+ */
+export function useExplainQuery(): {
+  explain: (body: ExplainQueryBody) => Promise<void>
+  response: ExplainQueryResponse | null
+  isLoading: boolean
+  error: string | null
+  reset: () => void
+} {
+  const [response, setResponse] = useState<ExplainQueryResponse | null>(null)
+  const [isLoading, setIsLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const reset = useCallback(() => {
+    setResponse(null)
+    setError(null)
+  }, [])
+
+  const explain = useCallback(async (body: ExplainQueryBody): Promise<void> => {
+    setIsLoading(true)
+    setError(null)
+    setResponse(null)
+
+    try {
+      const res = await fetch(
+        `${env.NEXT_PUBLIC_API_URL}/api/v1/ai/explain-query`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      if (!res.ok) {
+        const text = await res.text().catch(() => 'Unknown error')
+        setError(`API error ${res.status}: ${text}`)
+        return
+      }
+      const data = (await res.json()) as ExplainQueryResponse
+      setResponse(data)
+    } catch {
+      setError('Network error. Please check your connection.')
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  return { explain, response, isLoading, error, reset }
+}
+
+/**
+ * SQL düzeltme hook'u.
+ * Streaming SSE ile karakter karakter gösterim.
+ */
+export function useFixQuery(): {
+  fix: (body: FixQueryBody) => Promise<void>
+  state: StreamState
+  reset: () => void
+} {
+  const [state, setState] = useState<StreamState>(INITIAL_STREAM_STATE)
+
+  const reset = useCallback(() => setState(INITIAL_STREAM_STATE), [])
+
+  const fix = useCallback(async (body: FixQueryBody): Promise<void> => {
+    setState({ text: '', isStreaming: true, error: null })
+
+    await readSseStream(
+      '/api/v1/ai/fix-query',
+      body,
+      (chunk) => setState((prev) => ({ ...prev, text: prev.text + chunk })),
+      () => setState((prev) => ({ ...prev, isStreaming: false })),
+      (err) => setState({ text: '', isStreaming: false, error: err }),
+    )
+  }, [])
+
+  return { fix, state, reset }
+}
+```
+
+---
+
+### STEP-24: apps/web/src/components/ai/ai-assistant-panel.tsx
+
+**Oluşturulacak dosya:** `apps/web/src/components/ai/ai-assistant-panel.tsx`
+
+**Bağımlılıklar:** STEP-21, STEP-22, STEP-23
+
+Bu bileşen:
+- Sağ tarafta collapsible panel olarak render edilir
+- 3 sekme: "SQL Öner", "Açıkla", "Düzelt"
+- Her sekmede ilgili hook kullanılır
+- "Uygula" butonu `onApplySql` callback'i ile Monaco editöre SQL yerleştirir
+- Streaming text karakter karakter gösterilir (`pre` tag + mono font)
+- AI accent rengi: `violet-500`
+
+```tsx
+'use client'
+
+import { ChevronLeft, ChevronRight, Loader2, Sparkles, Wand2 } from 'lucide-react'
+import { useTranslations } from 'next-intl'
+import { useState } from 'react'
+
+import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import { Label } from '@/components/ui/label'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useExplainQuery, useFixQuery, useSuggestQuery } from '@/hooks/use-ai'
+
+interface AiAssistantPanelProps {
+  /** Aktif rapor editörünün seçili veri kaynağı ID'si */
+  dataSourceId: string
+  /** Mevcut SQL editörün içeriği */
+  currentSql: string
+  /** "Uygula" butonuna basıldığında editöre SQL yazan callback */
+  onApplySql: (sql: string) => void
+}
+
+export function AiAssistantPanel({
+  dataSourceId,
+  currentSql,
+  onApplySql,
+}: AiAssistantPanelProps): JSX.Element {
+  const t = useTranslations('ai')
+  const [isOpen, setIsOpen] = useState(false)
+  const [naturalLanguagePrompt, setNaturalLanguagePrompt] = useState('')
+  const [fixErrorMessage, setFixErrorMessage] = useState('')
+
+  const { suggest, state: suggestState, reset: resetSuggest } = useSuggestQuery()
+  const {
+    explain,
+    response: explainResponse,
+    isLoading: isExplaining,
+    error: explainError,
+    reset: resetExplain,
+  } = useExplainQuery()
+  const { fix, state: fixState, reset: resetFix } = useFixQuery()
+
+  function handleSuggest(): void {
+    if (!naturalLanguagePrompt.trim() || !dataSourceId) return
+    resetSuggest()
+    void suggest({ prompt: naturalLanguagePrompt.trim(), dataSourceId })
+  }
+
+  function handleExplain(): void {
+    if (!currentSql.trim()) return
+    resetExplain()
+    void explain({ sql: currentSql })
+  }
+
+  function handleFix(): void {
+    if (!currentSql.trim() || !fixErrorMessage.trim()) return
+    resetFix()
+    void fix({ sql: currentSql, errorMessage: fixErrorMessage.trim() })
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm">
-        <DialogHeader>
-          <DialogTitle>{t('run')}</DialogTitle>
-        </DialogHeader>
-        <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-          <div className="space-y-1">
-            <Label>{t('format')}</Label>
-            <Select
-              value={form.watch('format')}
-              onValueChange={(v) => form.setValue('format', v as 'csv' | 'excel')}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="csv">CSV</SelectItem>
-                <SelectItem value="excel">Excel</SelectItem>
-              </SelectContent>
-            </Select>
+    <Collapsible open={isOpen} onOpenChange={setIsOpen} className="flex">
+      {/* Toggle trigger — panel kapalıyken dar bir şerit */}
+      <CollapsibleTrigger asChild>
+        <button
+          className="flex items-center justify-center w-7 shrink-0 bg-muted/40 hover:bg-muted border-l border-border transition-colors"
+          aria-label={isOpen ? t('closePanel') : t('openPanel')}
+        >
+          {isOpen ? (
+            <ChevronRight className="h-4 w-4 text-violet-400" />
+          ) : (
+            <ChevronLeft className="h-4 w-4 text-violet-400" />
+          )}
+        </button>
+      </CollapsibleTrigger>
+
+      {/* Panel içeriği */}
+      <CollapsibleContent className="w-80 shrink-0 border-l border-border bg-background overflow-y-auto">
+        <div className="p-4 space-y-4">
+          {/* Başlık */}
+          <div className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-violet-400" />
+            <span className="text-sm font-semibold text-foreground">
+              {t('panelTitle')}
+            </span>
           </div>
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {tc('cancel')}
-            </Button>
-            <Button type="submit" disabled={runReport.isPending}>
-              {t('download')}
-            </Button>
-          </div>
-        </form>
-      </DialogContent>
-    </Dialog>
+
+          <Tabs defaultValue="suggest">
+            <TabsList className="w-full">
+              <TabsTrigger value="suggest" className="flex-1 text-xs">
+                {t('tabSuggest')}
+              </TabsTrigger>
+              <TabsTrigger value="explain" className="flex-1 text-xs">
+                {t('tabExplain')}
+              </TabsTrigger>
+              <TabsTrigger value="fix" className="flex-1 text-xs">
+                {t('tabFix')}
+              </TabsTrigger>
+            </TabsList>
+
+            {/* SQL ONERME sekmesi */}
+            <TabsContent value="suggest" className="space-y-3">
+              <div className="space-y-1">
+                <Label className="text-xs">{t('suggestPromptLabel')}</Label>
+                <textarea
+                  className="w-full min-h-[80px] resize-y rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder={t('suggestPromptPlaceholder')}
+                  value={naturalLanguagePrompt}
+                  onChange={(e) => setNaturalLanguagePrompt(e.target.value)}
+                  disabled={suggestState.isStreaming}
+                />
+              </div>
+
+              {!dataSourceId && (
+                <p className="text-xs text-amber-500">{t('noDataSourceWarning')}</p>
+              )}
+
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={handleSuggest}
+                disabled={
+                  suggestState.isStreaming ||
+                  !naturalLanguagePrompt.trim() ||
+                  !dataSourceId
+                }
+              >
+                {suggestState.isStreaming ? (
+                  <>
+                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                    {t('generating')}
+                  </>
+                ) : (
+                  <>
+                    <Wand2 className="mr-2 h-3 w-3" />
+                    {t('suggestButton')}
+                  </>
+                )}
+              </Button>
+
+              {suggestState.error && (
+                <p className="text-xs text-destructive">{suggestState.error}</p>
+              )}
+
+              {(suggestState.text || suggestState.isStreaming) && (
+                <div className="space-y-2">
+                  <pre className="w-full min-h-[80px] max-h-64 overflow-auto rounded-md border border-border bg-muted/50 p-2 text-xs font-mono text-foreground whitespace-pre-wrap break-all">
+                    {suggestState.text}
+                    {suggestState.isStreaming && (
+                      <span className="inline-block w-1.5 h-3 bg-violet-400 animate-pulse ml-0.5" />
+                    )}
+                  </pre>
+                  {!suggestState.isStreaming && suggestState.text && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full text-violet-400 border-violet-400/30 hover:bg-violet-400/10"
+                      onClick={() => onApplySql(suggestState.text)}
+                    >
+                      {t('applyToEditor')}
+                    </Button>
+                  )}
+                </div>
+              )}
+            </TabsContent>
+
+            {/* ACIKLAMA sekmesi */}
+            <TabsContent value="explain" className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                {t('explainDescription')}
+              </p>
+
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={handleExplain}
+                disabled={isExplaining || !currentSql.trim()}
+              >
+                {isExplaining ? (
+                  <>
+                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                    {t('explaining')}
+                  </>
+                ) : (
+                  t('explainButton')
+                )}
+              </Button>
+
+              {explainError && (
+                <p className="text-xs text-destructive">{explainError}</p>
+              )}
+
+              {explainResponse && (
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">Turkce</Label>
+                    <p className="text-xs leading-relaxed text-foreground">
+                      {explainResponse.turkish}
+                    </p>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">English</Label>
+                    <p className="text-xs leading-relaxed text-foreground">
+                      {explainResponse.english}
+                    </p>
+                  </div>
+                </div>
+              )}
+            </TabsContent>
+
+            {/* DUZELTME sekmesi */}
+            <TabsContent value="fix" className="space-y-3">
+              <div className="space-y-1">
+                <Label className="text-xs">{t('fixErrorLabel')}</Label>
+                <textarea
+                  className="w-full min-h-[60px] resize-y rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  placeholder={t('fixErrorPlaceholder')}
+                  value={fixErrorMessage}
+                  onChange={(e) => setFixErrorMessage(e.target.value)}
+                  disabled={fixState.isStreaming}
+                />
+              </div>
+
+              <Button
+                size="sm"
+                className="w-full"
+                onClick={handleFix}
+                disabled={
+                  fixState.isStreaming ||
+                  !currentSql.trim() ||
+                  !fixErrorMessage.trim()
+                }
+              >
+                {fixState.isStreaming ? (
+                  <>
+                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                    {t('fixing')}
+                  </>
+                ) : (
+                  t('fixButton')
+                )}
+              </Button>
+
+              {fixState.error && (
+                <p className="text-xs text-destructive">{fixState.error}</p>
+              )}
+
+              {(fixState.text || fixState.isStreaming) && (
+                <div className="space-y-2">
+                  <pre className="w-full min-h-[80px] max-h-64 overflow-auto rounded-md border border-border bg-muted/50 p-2 text-xs font-mono text-foreground whitespace-pre-wrap break-all">
+                    {fixState.text}
+                    {fixState.isStreaming && (
+                      <span className="inline-block w-1.5 h-3 bg-violet-400 animate-pulse ml-0.5" />
+                    )}
+                  </pre>
+                  {!fixState.isStreaming && fixState.text && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full text-violet-400 border-violet-400/30 hover:bg-violet-400/10"
+                      onClick={() => onApplySql(fixState.text)}
+                    >
+                      {t('applyToEditor')}
+                    </Button>
+                  )}
+                </div>
+              )}
+            </TabsContent>
+          </Tabs>
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
   )
 }
 ```
 
 ---
 
-### STEP-26: Report Editor — New Report page
+### STEP-25: apps/web/src/app/[locale]/reports/[id]/edit/report-editor-client.tsx Guncellemesi
 
-Dosya: `apps/web/src/app/[locale]/reports/new/page.tsx`
+**Guncellenecek dosya:** `apps/web/src/app/[locale]/reports/[id]/edit/report-editor-client.tsx`
 
-```tsx
-import { ReportEditorClient } from '../[id]/edit/report-editor-client'
+**Bagimliliklar:** STEP-24
 
-export default function NewReportPage() {
-  return <ReportEditorClient />
-}
-```
-
----
-
-### STEP-27: Report Editor Client — Full Designer
-
-Dosya: `apps/web/src/app/[locale]/reports/[id]/edit/page.tsx`
-
-```tsx
-import { ReportEditorClient } from './report-editor-client'
-
-interface EditReportPageProps {
-  params: Promise<{ id: string }>
-}
-
-export default async function EditReportPage({ params }: EditReportPageProps) {
-  const { id } = await params
-  return <ReportEditorClient reportId={id} />
-}
-```
-
-Dosya: `apps/web/src/app/[locale]/reports/[id]/edit/report-editor-client.tsx`
+Degisiklikler:
+1. `AiAssistantPanel` import edilir
+2. Ana layout `flex` olur — sol taraf mevcut editor (`flex-1`), sag taraf AI panel
+3. Monaco editor `store.setField` callback'i `onApplySql`'e baglanir
 
 ```tsx
 'use client'
 import dynamic from 'next/dynamic'
 import { useTranslations } from 'next-intl'
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -1843,6 +2010,7 @@ import { Switch } from '@/components/ui/switch'
 import { useReport, useCreateReport, useUpdateReport } from '@/hooks/use-reports'
 import { useDataSources } from '@/hooks/use-data-sources'
 import { useReportEditorStore } from '@/store/report-editor.store'
+import { AiAssistantPanel } from '@/components/ai/ai-assistant-panel'
 import { ParameterList } from './parameter-list'
 import { useRouter } from 'next/navigation'
 
@@ -1858,120 +2026,155 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
   const router = useRouter()
 
   const store = useReportEditorStore()
+  const loadReport = useReportEditorStore((s) => s.loadReport)
   const { data: report } = useReport(reportId ?? '')
   const { data: dataSources } = useDataSources()
   const createReport = useCreateReport()
   const updateReport = useUpdateReport(reportId ?? '')
 
   useEffect(() => {
-    if (report) store.loadReport(report as Parameters<typeof store.loadReport>[0])
-  }, [report])
+    if (report) {
+      loadReport({
+        id: report.id,
+        name: report.name,
+        description: report.description,
+        dataSourceId: report.dataSourceId,
+        query: report.query,
+        parameters: report.parameters.map((p, i) => ({
+          id: `param-${i}`,
+          name: p.name,
+          type: p.type,
+          label: p.label,
+          required: p.required,
+          defaultValue: p.defaultValue,
+          options: p.options,
+        })),
+        exportFormats: report.exportFormats,
+      })
+    }
+  }, [report, loadReport])
 
-  async function handleSave() {
-    const payload = {
-      name: store.name,
-      description: store.description || undefined,
-      dataSourceId: store.dataSourceId,
-      query: store.query,
-      parameters: store.parameters,
-      exportFormats: store.exportFormats,
+  async function handleSave(): Promise<void> {
+    try {
+      const payload = {
+        name: store.name,
+        description: store.description || undefined,
+        dataSourceId: store.dataSourceId,
+        query: store.query,
+        parameters: store.parameters,
+        exportFormats: store.exportFormats,
+      }
+      if (reportId) {
+        await updateReport.mutateAsync(payload)
+      } else {
+        const created = await createReport.mutateAsync(payload)
+        const safeId = /^[\w-]+$/.test(created.id) ? created.id : null
+        if (!safeId) throw new Error('Invalid report id returned from server')
+        router.push(`/reports/${safeId}/edit`)
+      }
+      store.resetDirty()
+    } catch (err) {
+      throw err
     }
-    if (reportId) {
-      await updateReport.mutateAsync(payload)
-    } else {
-      const created = await createReport.mutateAsync(payload)
-      router.push(`/reports/${created.id}/edit`)
-    }
-    store.resetDirty()
   }
 
   const isPending = createReport.isPending || updateReport.isPending
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">
-          {reportId ? t('editTitle') : t('createNew')}
-        </h1>
-        <div className="flex gap-2">
-          {store.isDirty && (
-            <span className="text-sm text-muted-foreground self-center">Unsaved changes</span>
-          )}
-          <Button onClick={handleSave} disabled={isPending}>
-            {tc('save')}
-          </Button>
+    <div className="flex h-full">
+      {/* Ana editor alani */}
+      <div className="flex-1 overflow-auto space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold">
+            {reportId ? t('editTitle') : t('createNew')}
+          </h1>
+          <div className="flex gap-2">
+            {store.isDirty && (
+              <span className="text-sm text-muted-foreground self-center">{tc('unsavedChanges')}</span>
+            )}
+            <Button onClick={handleSave} disabled={isPending}>
+              {tc('save')}
+            </Button>
+          </div>
         </div>
-      </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        <div className="space-y-4">
-          <div className="space-y-1">
-            <Label>{tc('name')}</Label>
-            <Input value={store.name} onChange={(e) => store.setField('name', e.target.value)} />
-          </div>
-          <div className="space-y-1">
-            <Label>{tc('description')}</Label>
-            <Input
-              value={store.description}
-              onChange={(e) => store.setField('description', e.target.value)}
-            />
-          </div>
-          <div className="space-y-1">
-            <Label>Data Source</Label>
-            <Select
-              value={store.dataSourceId}
-              onValueChange={(v) => store.setField('dataSourceId', v)}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder="Select data source..." />
-              </SelectTrigger>
-              <SelectContent>
-                {dataSources?.map((ds) => (
-                  <SelectItem key={ds.id} value={ds.id}>{ds.name}</SelectItem>
+        <div className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-4">
+            <div className="space-y-1">
+              <Label>{tc('name')}</Label>
+              <Input value={store.name} onChange={(e) => store.setField('name', e.target.value)} />
+            </div>
+            <div className="space-y-1">
+              <Label>{tc('description')}</Label>
+              <Input
+                value={store.description}
+                onChange={(e) => store.setField('description', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label>Data Source</Label>
+              <Select
+                value={store.dataSourceId}
+                onValueChange={(v) => store.setField('dataSourceId', v)}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select data source..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {dataSources?.map((ds) => (
+                    <SelectItem key={ds.id} value={ds.id}>{ds.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>{t('exportFormats')}</Label>
+              <div className="flex gap-4">
+                {(['csv', 'excel'] as const).map((fmt) => (
+                  <div key={fmt} className="flex items-center gap-2">
+                    <Switch
+                      checked={store.exportFormats.includes(fmt)}
+                      onCheckedChange={(checked) => {
+                        const next = checked
+                          ? [...store.exportFormats, fmt]
+                          : store.exportFormats.filter((f) => f !== fmt)
+                        store.setField('exportFormats', next)
+                      }}
+                    />
+                    <Label className="capitalize">{fmt}</Label>
+                  </div>
                 ))}
-              </SelectContent>
-            </Select>
+              </div>
+            </div>
           </div>
+
           <div className="space-y-1">
-            <Label>{t('exportFormats')}</Label>
-            <div className="flex gap-4">
-              {(['csv', 'excel'] as const).map((fmt) => (
-                <div key={fmt} className="flex items-center gap-2">
-                  <Switch
-                    checked={store.exportFormats.includes(fmt)}
-                    onCheckedChange={(checked) => {
-                      const next = checked
-                        ? [...store.exportFormats, fmt]
-                        : store.exportFormats.filter((f) => f !== fmt)
-                      store.setField('exportFormats', next)
-                    }}
-                  />
-                  <Label className="capitalize">{fmt}</Label>
-                </div>
-              ))}
+            <Label>{t('query')}</Label>
+            <div className="h-64 rounded-md border overflow-hidden">
+              <MonacoEditor
+                height="100%"
+                language="sql"
+                theme="vs-dark"
+                value={store.query}
+                onChange={(v) => store.setField('query', v ?? '')}
+                options={{ minimap: { enabled: false }, fontSize: 13, wordWrap: 'on' }}
+              />
             </div>
           </div>
         </div>
 
-        <div className="space-y-1">
-          <Label>{t('query')}</Label>
-          <div className="h-64 rounded-md border overflow-hidden">
-            <MonacoEditor
-              height="100%"
-              language="sql"
-              theme="vs-dark"
-              value={store.query}
-              onChange={(v) => store.setField('query', v ?? '')}
-              options={{ minimap: { enabled: false }, fontSize: 13, wordWrap: 'on' }}
-            />
-          </div>
+        <div className="space-y-2">
+          <Label>{t('parameters')}</Label>
+          <ParameterList />
         </div>
       </div>
 
-      <div className="space-y-2">
-        <Label>{t('parameters')}</Label>
-        <ParameterList />
-      </div>
+      {/* AI Yardimcisi paneli -- sagda, collapsible */}
+      <AiAssistantPanel
+        dataSourceId={store.dataSourceId}
+        currentSql={store.query}
+        onApplySql={(sql) => store.setField('query', sql)}
+      />
     </div>
   )
 }
@@ -1979,425 +2182,355 @@ export function ReportEditorClient({ reportId }: ReportEditorClientProps) {
 
 ---
 
-### STEP-28: Parameter List with DnD
+### STEP-26: i18n Mesaj Dosyalari Guncellemesi
 
-Dosya: `apps/web/src/app/[locale]/reports/[id]/edit/parameter-list.tsx`
+**Guncellenecek dosyalar:**
+- `apps/web/src/i18n/messages/en.json`
+- `apps/web/src/i18n/messages/tr.json`
 
-```tsx
-'use client'
-import { DndContext, closestCenter, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
-import type { DragEndEvent } from '@dnd-kit/core'
-import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
-import { GripVertical, Plus, Trash2 } from 'lucide-react'
-import { useTranslations } from 'next-intl'
-import { useId } from 'react'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Switch } from '@/components/ui/switch'
-import { useReportEditorStore } from '@/store/report-editor.store'
+Builder mevcut dosyalari okuyup `"ai"` namespace'ini ekler. Tum mevcut key'ler korunur.
 
-const PARAM_TYPES = ['string', 'number', 'date', 'dateRange', 'select', 'multiSelect', 'boolean'] as const
-
-interface SortableParamRowProps {
-  param: { id: string; name: string; type: string; label: string; required: boolean }
-}
-
-function SortableParamRow({ param }: SortableParamRowProps) {
-  const t = useTranslations('report')
-  const tc = useTranslations('common')
-  const store = useReportEditorStore()
-  const { attributes, listeners, setNodeRef, transform, transition } = useSortable({ id: param.id })
-
-  const style = { transform: CSS.Transform.toString(transform), transition }
-
-  return (
-    <div ref={setNodeRef} style={style} className="flex items-center gap-2 rounded-md border p-3">
-      <button {...attributes} {...listeners} className="cursor-grab text-muted-foreground hover:text-foreground">
-        <GripVertical className="h-4 w-4" />
-      </button>
-      <div className="grid flex-1 grid-cols-4 gap-2">
-        <div className="space-y-1">
-          <Label className="text-xs">{t('paramName')}</Label>
-          <Input
-            className="h-8 text-sm"
-            value={param.name}
-            onChange={(e) => {
-              const params = [...store.parameters]
-              const idx = params.findIndex((p) => p.id === param.id)
-              if (idx !== -1) {
-                params[idx] = { ...params[idx]!, name: e.target.value }
-                store.setField('parameters', params)
-              }
-            }}
-          />
-        </div>
-        <div className="space-y-1">
-          <Label className="text-xs">{t('paramLabel')}</Label>
-          <Input
-            className="h-8 text-sm"
-            value={param.label}
-            onChange={(e) => {
-              const params = [...store.parameters]
-              const idx = params.findIndex((p) => p.id === param.id)
-              if (idx !== -1) {
-                params[idx] = { ...params[idx]!, label: e.target.value }
-                store.setField('parameters', params)
-              }
-            }}
-          />
-        </div>
-        <div className="space-y-1">
-          <Label className="text-xs">{t('paramType')}</Label>
-          <Select
-            value={param.type}
-            onValueChange={(v) => {
-              const params = [...store.parameters]
-              const idx = params.findIndex((p) => p.id === param.id)
-              if (idx !== -1) {
-                params[idx] = { ...params[idx]!, type: v }
-                store.setField('parameters', params)
-              }
-            }}
-          >
-            <SelectTrigger className="h-8 text-sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {PARAM_TYPES.map((pt) => (
-                <SelectItem key={pt} value={pt}>{pt}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex items-end gap-2 pb-1">
-          <div className="flex items-center gap-1">
-            <Switch
-              checked={param.required}
-              onCheckedChange={(checked) => {
-                const params = [...store.parameters]
-                const idx = params.findIndex((p) => p.id === param.id)
-                if (idx !== -1) {
-                  params[idx] = { ...params[idx]!, required: checked }
-                  store.setField('parameters', params)
-                }
-              }}
-            />
-            <Label className="text-xs">{t('paramRequired')}</Label>
-          </div>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-8 w-8 text-destructive"
-            onClick={() => store.removeParameter(param.id)}
-          >
-            <Trash2 className="h-3 w-3" />
-          </Button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-export function ParameterList() {
-  const t = useTranslations('report')
-  const store = useReportEditorStore()
-  const uid = useId()
-
-  const sensors = useSensors(useSensor(PointerSensor))
-
-  function handleDragEnd(event: DragEndEvent) {
-    const { active, over } = event
-    if (!over || active.id === over.id) return
-    const oldIndex = store.parameters.findIndex((p) => p.id === active.id)
-    const newIndex = store.parameters.findIndex((p) => p.id === over.id)
-    if (oldIndex !== -1 && newIndex !== -1) {
-      store.reorderParameters(oldIndex, newIndex)
-    }
-  }
-
-  function addParameter() {
-    store.addParameter({
-      id: crypto.randomUUID(),
-      name: '',
-      type: 'string',
-      label: '',
-      required: false,
-    })
-  }
-
-  return (
-    <div className="space-y-2">
-      <DndContext id={uid} sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-        <SortableContext items={store.parameters.map((p) => p.id)} strategy={verticalListSortingStrategy}>
-          {store.parameters.map((param) => (
-            <SortableParamRow key={param.id} param={param} />
-          ))}
-        </SortableContext>
-      </DndContext>
-      <Button variant="outline" size="sm" onClick={addParameter}>
-        <Plus className="mr-2 h-3 w-3" />
-        {t('addParameter')}
-      </Button>
-    </div>
-  )
-}
-```
-
----
-
-### STEP-29: Run History page
-
-Dosya: `apps/web/src/app/[locale]/reports/[id]/runs/page.tsx`
-
-```tsx
-import { RunHistoryClient } from './run-history-client'
-
-interface RunsPageProps {
-  params: Promise<{ id: string }>
-}
-
-export default async function RunsPage({ params }: RunsPageProps) {
-  const { id } = await params
-  return <RunHistoryClient reportId={id} />
-}
-```
-
-Dosya: `apps/web/src/app/[locale]/reports/[id]/runs/run-history-client.tsx`
-
-```tsx
-'use client'
-import { format } from 'date-fns'
-import { useTranslations } from 'next-intl'
-import Link from 'next/link'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { useReportRuns } from '@/hooks/use-reports'
-
-interface RunHistoryClientProps {
-  reportId: string
-}
-
-export function RunHistoryClient({ reportId }: RunHistoryClientProps) {
-  const t = useTranslations('report')
-  const tc = useTranslations('common')
-  const { data: runs, isLoading } = useReportRuns(reportId)
-
-  const statusVariant = (status: string) => {
-    if (status === 'completed') return 'success' as const
-    if (status === 'failed') return 'destructive' as const
-    return 'secondary' as const
-  }
-
-  if (isLoading) return <p className="text-muted-foreground">{tc('loading')}</p>
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">{t('runHistory')}</h1>
-        <Button variant="outline" asChild>
-          <Link href={`/reports/${reportId}/edit`}>{tc('back')}</Link>
-        </Button>
-      </div>
-      <div className="space-y-2">
-        {runs?.map((run) => (
-          <Card key={run.id}>
-            <CardContent className="flex items-center justify-between p-4">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <Badge variant={statusVariant(run.status)}>{t(run.status as 'running' | 'completed' | 'failed')}</Badge>
-                  <span className="text-sm font-medium uppercase">{run.format}</span>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {t('startedAt')}: {format(new Date(run.startedAt), 'dd MMM yyyy HH:mm:ss')}
-                </p>
-                {run.completedAt && (
-                  <p className="text-xs text-muted-foreground">
-                    {t('completedAt')}: {format(new Date(run.completedAt), 'dd MMM yyyy HH:mm:ss')}
-                  </p>
-                )}
-                {run.errorMessage && (
-                  <p className="text-xs text-destructive">{run.errorMessage}</p>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-        {runs?.length === 0 && <p className="text-muted-foreground">{tc('noData')}</p>}
-      </div>
-    </div>
-  )
-}
-```
-
----
-
-### STEP-30: Settings page (placeholder)
-
-Dosya: `apps/web/src/app/[locale]/settings/page.tsx`
-
-```tsx
-export default function SettingsPage() {
-  return (
-    <div className="space-y-4">
-      <h1 className="text-2xl font-bold">Settings</h1>
-      <p className="text-muted-foreground">Coming soon.</p>
-    </div>
-  )
-}
-```
-
----
-
-### STEP-31: Not Found page
-
-Dosya: `apps/web/src/app/[locale]/not-found.tsx`
-
-```tsx
-import Link from 'next/link'
-import { Button } from '@/components/ui/button'
-
-export default function NotFound() {
-  return (
-    <div className="flex flex-col items-center justify-center h-full gap-4">
-      <h2 className="text-3xl font-bold">404</h2>
-      <p className="text-muted-foreground">Page not found</p>
-      <Button asChild>
-        <Link href="/reports">Go to Reports</Link>
-      </Button>
-    </div>
-  )
-}
-```
-
----
-
-### STEP-32: turbo.json güncelleme
-
-Mevcut `turbo.json` dosyasına `web` pipeline ekle:
+**en.json — eklenecek `"ai"` blogu:**
 
 ```json
-{
-  "$schema": "https://turbo.build/schema.json",
-  "tasks": {
-    "build": {
-      "dependsOn": ["^build"],
-      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
-    },
-    "dev": {
-      "cache": false,
-      "persistent": true
-    },
-    "lint": {},
-    "type-check": {},
-    "test": {
-      "dependsOn": ["^build"]
-    },
-    "test:coverage": {
-      "dependsOn": ["^build"]
-    }
-  }
+"ai": {
+  "panelTitle": "Scriba AI",
+  "openPanel": "Open AI Assistant",
+  "closePanel": "Close AI Assistant",
+  "tabSuggest": "Suggest",
+  "tabExplain": "Explain",
+  "tabFix": "Fix",
+  "suggestPromptLabel": "Describe what you want to query",
+  "suggestPromptPlaceholder": "e.g. Show total sales by month for last year",
+  "suggestButton": "Generate SQL",
+  "generating": "Generating...",
+  "applyToEditor": "Apply to Editor",
+  "noDataSourceWarning": "Select a data source first.",
+  "explainDescription": "Explains the current SQL query in the editor in Turkish and English.",
+  "explainButton": "Explain Query",
+  "explaining": "Explaining...",
+  "fixErrorLabel": "Error message from database",
+  "fixErrorPlaceholder": "e.g. Incorrect syntax near 'FORM'.",
+  "fixButton": "Fix Query",
+  "fixing": "Fixing..."
+}
+```
+
+**tr.json — eklenecek `"ai"` blogu:**
+
+```json
+"ai": {
+  "panelTitle": "Scriba AI",
+  "openPanel": "AI Yardimcisini Ac",
+  "closePanel": "AI Yardimcisini Kapat",
+  "tabSuggest": "Oner",
+  "tabExplain": "Acikla",
+  "tabFix": "Duzelt",
+  "suggestPromptLabel": "Ne sorgulamak istediginizi aciklayin",
+  "suggestPromptPlaceholder": "orn. Gecen yilin aylik toplam satislarini goster",
+  "suggestButton": "SQL Uret",
+  "generating": "Uretiliyor...",
+  "applyToEditor": "Editore Uygula",
+  "noDataSourceWarning": "Once bir veri kaynagi secin.",
+  "explainDescription": "Editordeki mevcut SQL sorgusunu Turkce ve Ingilizce olarak aciklar.",
+  "explainButton": "Sorguyu Acikla",
+  "explaining": "Aciklaniyor...",
+  "fixErrorLabel": "Veritabani hata mesaji",
+  "fixErrorPlaceholder": "orn. 'FORM' sozcugu yakininda yanlis sozdizimi.",
+  "fixButton": "Sorguyu Duzelt",
+  "fixing": "Duzeltiliyor..."
 }
 ```
 
 ---
 
-### STEP-33: packages/shared-types — DataSourceRecord type
+### STEP-27: apps/api/src/modules/ai/ai.service.spec.ts (Birim Test)
 
-`packages/shared-types/src/index.ts` dosyasında `DataSourceRecord` tipinin eksik alanları varsa ekle (host, port, database, username alanları). Bu tipin `apps/api` datasource repository'si ile uyumlu olduğunu doğrula.
+**Olusturulacak dosya:** `apps/api/src/modules/ai/ai.service.spec.ts`
+
+**Bagimliliklar:** STEP-15
+
+```typescript
+import type { AiClient, AiStreamChunk, AiTextResponse } from '@datascriba/ai-client'
+import type { ColumnMeta, TableMeta } from '@datascriba/shared-types'
+import type { ConfigService } from '@nestjs/config'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+import type { DataSourceService } from '../data-source/data-source.service'
+import { AiService } from './ai.service'
+
+// AiClient mock — gercek API cagrisi yapilmaz
+const mockSuggestQuery = vi.fn()
+const mockExplainQuery = vi.fn()
+const mockFixQuery = vi.fn()
+
+vi.mock('@datascriba/ai-client', () => ({
+  AiClient: vi.fn().mockImplementation(() => ({
+    suggestQuery: mockSuggestQuery,
+    explainQuery: mockExplainQuery,
+    fixQuery: mockFixQuery,
+  })),
+}))
+
+const MOCK_TABLES: TableMeta[] = [
+  { schema: 'dbo', name: 'Orders', type: 'table' },
+]
+
+const MOCK_COLUMNS: ColumnMeta[] = [
+  { name: 'Id', dataType: 'int', nullable: false, isPrimaryKey: true, defaultValue: null },
+  { name: 'Total', dataType: 'decimal', nullable: true, isPrimaryKey: false, defaultValue: null },
+]
+
+function makeDataSourceService(): DataSourceService {
+  return {
+    listTables: vi.fn().mockResolvedValue(MOCK_TABLES),
+    describeTable: vi.fn().mockResolvedValue(MOCK_COLUMNS),
+  } as unknown as DataSourceService
+}
+
+function makeConfigService(): ConfigService {
+  return {
+    get: vi.fn().mockImplementation((key: string) => {
+      if (key === 'ANTHROPIC_API_KEY') return 'test-key'
+      if (key === 'AI_MODEL') return 'claude-sonnet-4-6'
+      return undefined
+    }),
+  } as unknown as ConfigService
+}
+
+describe('AiService', () => {
+  let service: AiService
+  let dataSourceService: DataSourceService
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    dataSourceService = makeDataSourceService()
+    service = new AiService(makeConfigService(), dataSourceService)
+    service.onModuleInit()
+  })
+
+  describe('suggestQuery', () => {
+    it('yields stream chunks from AiClient.suggestQuery', async () => {
+      const chunks: AiStreamChunk[] = [
+        { type: 'delta', text: 'SELECT' },
+        { type: 'delta', text: ' * FROM [dbo].[Orders]' },
+        { type: 'done' },
+      ]
+      mockSuggestQuery.mockImplementation(async function* () {
+        for (const c of chunks) yield c
+      })
+
+      const result: AiStreamChunk[] = []
+      for await (const chunk of service.suggestQuery({
+        prompt: 'show all orders',
+        dataSourceId: 'ds-1',
+      })) {
+        result.push(chunk)
+      }
+
+      expect(result).toEqual(chunks)
+      expect(dataSourceService.listTables).toHaveBeenCalledWith('ds-1')
+      expect(dataSourceService.describeTable).toHaveBeenCalledWith('ds-1', 'dbo.Orders')
+    })
+  })
+
+  describe('explainQuery', () => {
+    it('parses ---TR--- and ---EN--- sections', async () => {
+      const mockResponse: AiTextResponse = {
+        text: '---TR---\nBu sorgu tum siparisleri dondurur.\n---EN---\nThis query returns all orders.',
+        model: 'claude-sonnet-4-6',
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheCreationInputTokens: 80,
+        cacheReadInputTokens: 0,
+      }
+      mockExplainQuery.mockResolvedValue(mockResponse)
+
+      const result = await service.explainQuery({ sql: 'SELECT * FROM [dbo].[Orders]' })
+
+      expect(result.turkish).toBe('Bu sorgu tum siparisleri dondurur.')
+      expect(result.english).toBe('This query returns all orders.')
+      expect(result.model).toBe('claude-sonnet-4-6')
+    })
+
+    it('uses full text as turkish if sections are missing', async () => {
+      const mockResponse: AiTextResponse = {
+        text: 'Plain explanation without sections.',
+        model: 'claude-sonnet-4-6',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 0,
+      }
+      mockExplainQuery.mockResolvedValue(mockResponse)
+
+      const result = await service.explainQuery({ sql: 'SELECT 1' })
+
+      expect(result.turkish).toBe('Plain explanation without sections.')
+      expect(result.english).toBe('')
+    })
+  })
+
+  describe('fixQuery', () => {
+    it('yields stream chunks from AiClient.fixQuery', async () => {
+      const chunks: AiStreamChunk[] = [
+        { type: 'delta', text: 'SELECT * FROM [dbo].[Orders]' },
+        { type: 'done' },
+      ]
+      mockFixQuery.mockImplementation(async function* () {
+        for (const c of chunks) yield c
+      })
+
+      const result: AiStreamChunk[] = []
+      for await (const chunk of service.fixQuery({
+        sql: 'SELECT * FORM Orders',
+        errorMessage: "Incorrect syntax near 'FORM'.",
+      })) {
+        result.push(chunk)
+      }
+
+      expect(result).toEqual(chunks)
+    })
+  })
+})
+```
 
 ---
 
-### STEP-34: Doğrulama Komutları
+### STEP-28: .env.example Guncellemesi
 
-Builder, her adımdan sonra aşağıdaki komutları çalıştırarak doğrulama yapmalı:
+**Guncellenecek dosya:** `.env.example`
+
+**Bagimliliklar:** STEP-10
+
+Builder mevcut `.env.example` dosyasini okuyup sonuna su blogu ekler:
 
 ```bash
-# Type check
-cd apps/web && pnpm type-check
+# Scriba AI (Phase 5)
+# Anthropic API key -- https://console.anthropic.com/
+ANTHROPIC_API_KEY=sk-ant-...
 
-# Lint
-cd apps/web && pnpm lint
+# Claude model -- default: claude-sonnet-4-6
+AI_MODEL=claude-sonnet-4-6
 
-# Build check (dev olmadan)
-cd apps/web && pnpm build
+# AI endpoint rate limit (requests per minute per IP)
+AI_RATE_LIMIT_RPM=10
 ```
 
 ---
 
-### STEP-35: PHASE_4_PROGRESS.md oluştur
+## Implementasyon Sirasi (Builder icin)
 
-Builder, tüm adımları tamamladıktan sonra `PHASE_4_PROGRESS.md` dosyasını oluşturmalı:
+Builder adimlari kesinlikle bu siraya gore uygular:
 
-```markdown
-# PHASE_4_PROGRESS.md
-
-**Faz:** 4 — Görsel Rapor Tasarımcısı
-**Durum:** ✅ Tamamlandı
-**Tarih:** [TARİH]
-
-## Tamamlanan Adımlar
-
-- [x] STEP-01: apps/web package.json
-- [x] STEP-02: tsconfig.json
-- [x] STEP-03: next.config.ts
-- [x] STEP-04: postcss.config.mjs
-- [x] STEP-05: lib/utils.ts
-- [x] STEP-06: lib/env.ts
-- [x] STEP-07: .env.local
-- [x] STEP-08: i18n message dosyaları (en + tr)
-- [x] STEP-09: i18n request.ts + routing.ts
-- [x] STEP-10: middleware.ts
-- [x] STEP-11: lib/api-client.ts
-- [x] STEP-12: hooks/use-data-sources.ts
-- [x] STEP-13: hooks/use-reports.ts
-- [x] STEP-14: store/report-editor.store.ts
-- [x] STEP-15: globals.css (TailwindCSS v4)
-- [x] STEP-16a-h: UI bileşenleri (button, input, label, select, badge, card, dialog, switch)
-- [x] STEP-17: providers.tsx
-- [x] STEP-18: layout/sidebar.tsx
-- [x] STEP-19: layout/header.tsx
-- [x] STEP-20: app/[locale]/layout.tsx
-- [x] STEP-21: app/[locale]/page.tsx + app/page.tsx
-- [x] STEP-22: data-sources page + client
-- [x] STEP-23: data-source-dialog.tsx
-- [x] STEP-24: reports page + client
-- [x] STEP-25: run-report-dialog.tsx
-- [x] STEP-26: reports/new/page.tsx
-- [x] STEP-27: report-editor-client.tsx
-- [x] STEP-28: parameter-list.tsx (DnD)
-- [x] STEP-29: run-history page + client
-- [x] STEP-30: settings page
-- [x] STEP-31: not-found page
-- [x] STEP-32: turbo.json güncelleme
-- [x] STEP-33: shared-types DataSourceRecord doğrulama
-- [x] STEP-34: Doğrulama komutları
-- [x] STEP-35: PHASE_4_PROGRESS.md
-
-## Notlar
-- apps/web Next.js 15 + TailwindCSS v4 + shadcn/ui v2 ile oluşturuldu
-- i18n: EN + TR (next-intl v3)
-- Dark mode: next-themes
-- SQL editörü: Monaco (dynamic import, ssr:false)
-- Sürükle-bırak parametre sıralama: @dnd-kit
-- Undo/redo: zundo + Zustand
+```
+1.  STEP-01  packages/ai-client/package.json + tsconfig.json
+2.  STEP-02  packages/ai-client/src/types.ts
+3.  STEP-03  packages/ai-client/src/prompts/suggest-query.ts
+4.  STEP-04  packages/ai-client/src/prompts/explain-query.ts
+5.  STEP-05  packages/ai-client/src/prompts/fix-query.ts
+6.  STEP-06  packages/ai-client/src/client.ts
+7.  STEP-07  packages/ai-client/src/index.ts
+8.  STEP-08  packages/shared-types/src/ai.ts
+9.  STEP-09  packages/shared-types/src/index.ts (ai export ekle)
+10. STEP-10  apps/api/src/config/env.ts
+11. STEP-11  apps/api/package.json
+12. [pnpm install -- kok dizinde]
+13. STEP-12  apps/api/src/modules/ai/dto/suggest-query.dto.ts
+14. STEP-13  apps/api/src/modules/ai/dto/explain-query.dto.ts
+15. STEP-14  apps/api/src/modules/ai/dto/fix-query.dto.ts
+16. STEP-15  apps/api/src/modules/ai/ai.service.ts
+17. STEP-16  apps/api/src/modules/ai/ai.controller.ts
+18. STEP-17  apps/api/src/modules/ai/ai.module.ts
+19. STEP-18  apps/api/src/app.module.ts
+20. STEP-19  apps/api/src/common/filters/app-exception.filter.ts
+21. STEP-20  apps/web/package.json
+22. [pnpm install -- kok dizinde]
+23. STEP-21  apps/web/src/components/ui/collapsible.tsx
+24. STEP-22  apps/web/src/components/ui/tabs.tsx
+25. STEP-23  apps/web/src/hooks/use-ai.ts
+26. STEP-24  apps/web/src/components/ai/ai-assistant-panel.tsx
+27. STEP-25  apps/web/src/app/[locale]/reports/[id]/edit/report-editor-client.tsx
+28. STEP-26  i18n/messages/en.json + tr.json
+29. STEP-27  apps/api/src/modules/ai/ai.service.spec.ts
+30. STEP-28  .env.example
+31. [pnpm type-check]
+32. [pnpm test -- filter api]
 ```
 
 ---
 
-## Tamamlanma Kriterleri
+## Test Etme Kilavuzu (Tester icin)
 
-- [ ] `pnpm type-check --filter=web` hatasız geçiyor
-- [ ] `pnpm lint --filter=web` hatasız geçiyor
-- [ ] `pnpm build --filter=web` başarıyla tamamlanıyor
-- [ ] `/en/data-sources` sayfası API'den veri kaynakları listiyor
-- [ ] `/en/reports` sayfası rapor listesini gösteriyor
-- [ ] Yeni rapor oluşturma formu çalışıyor
-- [ ] Monaco SQL editörü yükleniyor
-- [ ] Parametre sürükle-bırak sıralama çalışıyor
-- [ ] Rapor çalıştırma ve dosya indirme çalışıyor
-- [ ] Dark mode toggle çalışıyor
-- [ ] EN/TR dil değişimi çalışıyor
+### Birim Testler
+```bash
+pnpm --filter=@datascriba/api test
+# Beklenen: ai.service.spec.ts 3 describe / 4 test gecer
+```
+
+### Type Check
+```bash
+pnpm type-check
+# Beklenen: 0 hata
+```
+
+### Manuel Test (dev ortami)
+1. `.env.local`'a `ANTHROPIC_API_KEY` yaz
+2. `pnpm dev --filter=api` ile API'yi baslt
+3. `http://localhost:3001/api/docs` Swagger'dan AI endpoint'lerini test et
+4. `pnpm dev --filter=web` ile web'i baslt
+5. Rapor editorune git, sagdaki dar cubuktan AI panelini ac
+6. "SQL Oner" sekmesi: prompt yaz, "SQL Uret" tikla, streaming izle
+7. "Acikla" sekmesi: "Sorguyu Acikla" tikla, TR/EN aciklama gor
+8. "Duzelt" sekmesi: hata mesaji gir, "Sorguyu Duzelt" tikla
+
+### Rate Limit Testi
+```bash
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -X POST http://localhost:3001/api/v1/ai/explain-query \
+    -H "Content-Type: application/json" \
+    -d '{"sql":"SELECT 1"}'
+done
+# 11. istek 429 donmeli
+```
+
+---
+
+## Mimari Notlar
+
+### Neden `@Sse()` + `POST` birlikte?
+SSE teknik olarak `GET` metodunu bekler, ancak NestJS `@Sse()` herhangi bir HTTP metoduna uygulanabilir. Prompt body'de tasindigi icin `POST` zorunludur. Fastify adaptoru bu kombinasyonu destekler.
+
+### Neden `AsyncIterable` -> `Observable` donusumu?
+NestJS SSE `Observable<MessageEvent>` doner, `AiClient` ise `AsyncIterable<AiStreamChunk>` doner. RxJS `from()` operatoru bu donusumu gerceklestirir.
+
+### Neden `cache_control` icin `@ts-expect-error`?
+`@anthropic-ai/sdk` TypeScript tanimlari `cache_control` field'ini her durumda expose etmeyebilir. Builder SDK versiyonunu kontrol etmeli; eger SDK tipi zaten dogruysa `@ts-expect-error` kaldirilmali.
+
+### Neden tum semay prompt'a gonderiyoruz?
+MSSQL'de tablo sayisi genellikle onlarla sinirlidir. Tum semay gondermek hem dogruluk hem kolaylik saglar. Buyuk semalarda (500+ tablo) kullanicidan tablo secimi alternatif olabilir -- bu Faz 6'ya birakilir.
+
+### Collapsible Panel Yerlesimi
+`report-editor-client.tsx` `flex` layout'a gecer. AI paneli `w-80` sabit genislige sahip, ana editor `flex-1`. Panel kapaliiken `w-7` serit gorunur.
+
+---
+
+## Checklist (Reviewer icin)
+
+- [ ] `packages/ai-client/` paket yapisi olusturulmus
+- [ ] `AiClient` Anthropic SDK wraps, prompt caching var
+- [ ] 3 prompt dosyasi (`suggest-query`, `explain-query`, `fix-query`) ayri
+- [ ] `AiService.buildSchemaContext()` DataSourceService reuse ediyor
+- [ ] `AiController` 2x `@Sse()` + 1x `@Post()` endpoint
+- [ ] `ThrottlerModule` `AppModule`'de global, `@UseGuards(ThrottlerGuard)` AI controller'da
+- [ ] `AI_RATE_LIMIT_RPM` env'den aliniyor (hardcode yok)
+- [ ] `AI_MODEL` env'den aliniyor (hardcode yok)
+- [ ] `AppExceptionFilter` ThrottlerException -> 429 doniyor
+- [ ] `AiAssistantPanel` 3 sekme, collapsible, streaming gosterim
+- [ ] "Uygula" butonu `onApplySql` callback cairiyor
+- [ ] `use-ai.ts` SSE stream dogru parse ediyor
+- [ ] i18n `ai` namespace hem EN hem TR'de var
+- [ ] `any` yok, `console.log` yok
+- [ ] `ai.service.spec.ts` 4 test var, mock'lar gercek API cagrisi yapmiyor
+- [ ] `.env.example` guncellendi

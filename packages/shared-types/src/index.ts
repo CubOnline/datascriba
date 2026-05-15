@@ -15,3 +15,10 @@ export type {
   RunStatus,
   RunRecord,
 } from './report'
+export type {
+  SuggestQueryBody,
+  ExplainQueryBody,
+  FixQueryBody,
+  ExplainQueryResponse,
+  AiSseChunk,
+} from './ai'

@@ -1,4 +1,3 @@
-
 import {
   createDriver,
   decrypt,
@@ -16,6 +15,52 @@ import type { UpdateDataSourceDto } from './dto/update-data-source.dto'
 
 const DEFAULT_WORKSPACE_ID = 'default'
 
+/**
+ * ADO.NET connection string değerinde özel karakterleri escape eder.
+ * Değer içinde `;` veya `=` varsa tüm değer `{...}` ile sarılır.
+ * `{` ve `}` karakterleri içeride çift yazılır (ADO.NET escape kuralı).
+ * Bu sayede host/database/username/password alanlarına yazılan
+ * kötü amaçlı veriler ek connection string parametresi enjekte edemez.
+ */
+function escapeConnectionStringValue(value: string): string {
+  // Kaçış gerektiren karakter var mı?
+  if (/[;={}]/.test(value)) {
+    // İçindeki { ve } karakterlerini double'la, sonra { } ile sar
+    return `{${value.replace(/[{}]/g, (c) => c + c)}}`
+  }
+  return value
+}
+
+function buildConnectionString(opts: {
+  host: string
+  port: number
+  database: string
+  username: string
+  password: string
+  encrypt?: boolean
+  trustServerCertificate?: boolean
+  connectionTimeoutMs?: number
+}): string {
+  const encrypt = opts.encrypt ?? true
+  const trust = opts.trustServerCertificate ?? false
+  const timeoutSec = Math.round((opts.connectionTimeoutMs ?? 30_000) / 1000)
+
+  const host = escapeConnectionStringValue(opts.host)
+  const database = escapeConnectionStringValue(opts.database)
+  const username = escapeConnectionStringValue(opts.username)
+  const password = escapeConnectionStringValue(opts.password)
+
+  return (
+    `Server=${host},${opts.port};` +
+    `Database=${database};` +
+    `User Id=${username};` +
+    `Password=${password};` +
+    `Encrypt=${encrypt};` +
+    `TrustServerCertificate=${trust};` +
+    `Connection Timeout=${timeoutSec};`
+  )
+}
+
 @Injectable()
 export class DataSourceService {
   private readonly logger = new Logger(DataSourceService.name)
@@ -31,10 +76,24 @@ export class DataSourceService {
   }
 
   async create(dto: CreateDataSourceDto): Promise<DataSourceRecord> {
-    const encryptedConnectionString = encrypt(dto.connectionString, this.getMasterKey())
+    const connectionString = buildConnectionString({
+      host: dto.host,
+      port: dto.port,
+      database: dto.database,
+      username: dto.username,
+      password: dto.password,
+      encrypt: dto.encrypt,
+      trustServerCertificate: dto.trustServerCertificate,
+      connectionTimeoutMs: dto.connectionTimeoutMs,
+    })
+    const encryptedConnectionString = encrypt(connectionString, this.getMasterKey())
     const record = await this.repository.create({
       name: dto.name,
       type: dto.type,
+      host: dto.host,
+      port: dto.port,
+      database: dto.database,
+      username: dto.username,
       encryptedConnectionString,
       workspaceId: dto.workspaceId ?? DEFAULT_WORKSPACE_ID,
     })
@@ -57,17 +116,41 @@ export class DataSourceService {
     const existing = await this.repository.findById(id)
     if (!existing) throw new NotFoundException(`DataSource '${id}' not found`)
 
-    const patch: Partial<DataSourceRecord> = {}
+    const patch: Partial<Omit<DataSourceRecord, 'id' | 'workspaceId' | 'createdAt'>> = {}
     if (dto.name !== undefined) patch.name = dto.name
-    if (dto.connectionString !== undefined) {
-      patch.encryptedConnectionString = encrypt(dto.connectionString, this.getMasterKey())
+    if (dto.host !== undefined) patch.host = dto.host
+    if (dto.port !== undefined) patch.port = dto.port
+    if (dto.database !== undefined) patch.database = dto.database
+    if (dto.username !== undefined) patch.username = dto.username
+
+    const needsReEncrypt =
+      dto.host !== undefined ||
+      dto.port !== undefined ||
+      dto.database !== undefined ||
+      dto.username !== undefined ||
+      dto.password !== undefined ||
+      dto.encrypt !== undefined ||
+      dto.trustServerCertificate !== undefined ||
+      dto.connectionTimeoutMs !== undefined
+
+    if (needsReEncrypt) {
+      const connectionString = buildConnectionString({
+        host: dto.host ?? existing.host,
+        port: dto.port ?? existing.port,
+        database: dto.database ?? existing.database,
+        username: dto.username ?? existing.username,
+        password: dto.password ?? '',
+        encrypt: dto.encrypt,
+        trustServerCertificate: dto.trustServerCertificate,
+        connectionTimeoutMs: dto.connectionTimeoutMs,
+      })
+      patch.encryptedConnectionString = encrypt(connectionString, this.getMasterKey())
     }
 
     const updated = await this.repository.update(id, patch)
     if (!updated) throw new NotFoundException(`DataSource '${id}' not found`)
 
     this.logger.log({ dataSourceId: id }, 'DataSource updated')
-    // Invalidate cached schema and pool
     this.schemaCache.invalidate(id)
     await this.poolManager.remove(id)
 
@@ -110,7 +193,6 @@ export class DataSourceService {
     return driver.execute(sql, params)
   }
 
-  /** Returns record including encrypted string (used internally only). */
   private async getRecord(id: string): Promise<DataSourceRecord> {
     const record = await this.repository.findById(id)
     if (!record) throw new NotFoundException(`DataSource '${id}' not found`)
@@ -131,10 +213,6 @@ export class DataSourceService {
     return driver
   }
 
-  /**
-   * Never expose the encrypted connection string over HTTP.
-   * Return a sanitized copy.
-   */
   private sanitize(record: DataSourceRecord): DataSourceRecord {
     return {
       ...record,

@@ -16,7 +16,8 @@
     "noData": "Veri bulunamadı",
     "testConnection": "Bağlantıyı Test Et",
     "connected": "Bağlandı",
-    "failed": "Başarısız"
+    "failed": "Başarısız",
+    "unsavedChanges": "Kaydedilmemiş değişiklikler"
   },
   "nav": {
     "dataSources": "Veri Kaynakları",
@@ -61,5 +62,26 @@
     "paramLabel": "Etiket",
     "paramRequired": "Zorunlu",
     "paramDefault": "Varsayılan Değer"
+  },
+  "ai": {
+    "panelTitle": "Scriba AI",
+    "openPanel": "AI Yardimcisini Ac",
+    "closePanel": "AI Yardimcisini Kapat",
+    "tabSuggest": "Oner",
+    "tabExplain": "Acikla",
+    "tabFix": "Duzelt",
+    "suggestPromptLabel": "Ne sorgulamak istediginizi aciklayin",
+    "suggestPromptPlaceholder": "orn. Gecen yilin aylik toplam satislarini goster",
+    "suggestButton": "SQL Uret",
+    "generating": "Uretiliyor...",
+    "applyToEditor": "Editore Uygula",
+    "noDataSourceWarning": "Once bir veri kaynagi secin.",
+    "explainDescription": "Editordeki mevcut SQL sorgusunu Turkce ve Ingilizce olarak aciklar.",
+    "explainButton": "Sorguyu Acikla",
+    "explaining": "Aciklaniyor...",
+    "fixErrorLabel": "Veritabani hata mesaji",
+    "fixErrorPlaceholder": "orn. 'FORM' sozcugu yakininda yanlis sozdizimi.",
+    "fixButton": "Sorguyu Duzelt",
+    "fixing": "Duzeltiliyor..."
   }
 }

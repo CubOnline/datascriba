@@ -21,8 +21,8 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common'
+import { ThrottlerException } from '@nestjs/throttler'
 import type { FastifyReply, FastifyRequest } from 'fastify'
-
 
 interface ErrorResponse {
   statusCode: number
@@ -51,7 +51,6 @@ export class AppExceptionFilter implements ExceptionFilter {
       path: request.url,
     }
 
-    // Log unexpected errors at error level, domain errors at warn
     if (statusCode >= 500) {
       this.logger.error({ err: exception, path: request.url }, message)
     } else {
@@ -62,6 +61,9 @@ export class AppExceptionFilter implements ExceptionFilter {
   }
 
   private mapException(exception: unknown): { statusCode: number; message: string } {
+    if (exception instanceof ThrottlerException) {
+      return { statusCode: 429, message: 'Too many requests. Please wait before retrying.' }
+    }
     if (exception instanceof HttpException) {
       return { statusCode: exception.getStatus(), message: exception.message }
     }
@@ -86,7 +88,6 @@ export class AppExceptionFilter implements ExceptionFilter {
     if (exception instanceof DataSourceError) {
       return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: 'Data source error' }
     }
-    // Report engine errors
     if (exception instanceof ParameterValidationError) {
       return { statusCode: 422, message: exception.message }
     }

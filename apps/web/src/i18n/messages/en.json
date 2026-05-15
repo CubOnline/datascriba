@@ -16,7 +16,8 @@
     "noData": "No data found",
     "testConnection": "Test Connection",
     "connected": "Connected",
-    "failed": "Failed"
+    "failed": "Failed",
+    "unsavedChanges": "Unsaved changes"
   },
   "nav": {
     "dataSources": "Data Sources",
@@ -61,5 +62,26 @@
     "paramLabel": "Label",
     "paramRequired": "Required",
     "paramDefault": "Default Value"
+  },
+  "ai": {
+    "panelTitle": "Scriba AI",
+    "openPanel": "Open AI Assistant",
+    "closePanel": "Close AI Assistant",
+    "tabSuggest": "Suggest",
+    "tabExplain": "Explain",
+    "tabFix": "Fix",
+    "suggestPromptLabel": "Describe what you want to query",
+    "suggestPromptPlaceholder": "e.g. Show total sales by month for last year",
+    "suggestButton": "Generate SQL",
+    "generating": "Generating...",
+    "applyToEditor": "Apply to Editor",
+    "noDataSourceWarning": "Select a data source first.",
+    "explainDescription": "Explains the current SQL query in the editor in Turkish and English.",
+    "explainButton": "Explain Query",
+    "explaining": "Explaining...",
+    "fixErrorLabel": "Error message from database",
+    "fixErrorPlaceholder": "e.g. Incorrect syntax near 'FORM'.",
+    "fixButton": "Fix Query",
+    "fixing": "Fixing..."
   }
 }
