@@ -12,6 +12,7 @@ import {
   ApiBody,
   ApiOkResponse,
   ApiOperation,
+  ApiProduces,
   ApiTags,
 } from '@nestjs/swagger'
 import { ThrottlerGuard } from '@nestjs/throttler'
@@ -52,12 +53,12 @@ export class AiController {
   constructor(private readonly service: AiService) {}
 
   @Sse('suggest-query')
-  @ApiOperation({
-    summary: 'Generate SQL from natural language (streaming SSE)',
-  })
+  @ApiOperation({ summary: 'Generate SQL from natural language (streaming SSE)' })
   @ApiBody({ type: SuggestQueryDto })
+  @ApiProduces('text/event-stream')
   @ApiOkResponse({
-    description: 'Server-Sent Events stream of SQL tokens',
+    description: 'SSE stream. Events: {"type":"delta","text":"..."} or {"type":"done"}',
+    schema: { type: 'string' },
   })
   suggestQuery(@Body() dto: SuggestQueryDto): Observable<MessageEvent> {
     return chunkToSse(this.service.suggestQuery(dto))
@@ -76,12 +77,12 @@ export class AiController {
   }
 
   @Sse('fix-query')
-  @ApiOperation({
-    summary: 'Fix a broken SQL query (streaming SSE)',
-  })
+  @ApiOperation({ summary: 'Fix a broken SQL query (streaming SSE)' })
   @ApiBody({ type: FixQueryDto })
+  @ApiProduces('text/event-stream')
   @ApiOkResponse({
-    description: 'Server-Sent Events stream of corrected SQL tokens',
+    description: 'SSE stream of corrected SQL tokens',
+    schema: { type: 'string' },
   })
   fixQuery(@Body() dto: FixQueryDto): Observable<MessageEvent> {
     return chunkToSse(this.service.fixQuery(dto))

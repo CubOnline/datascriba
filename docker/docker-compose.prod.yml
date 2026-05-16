@@ -1,0 +1,47 @@
+# docker/docker-compose.prod.yml
+# Production overrides. Use together with docker-compose.yml:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
+version: '3.9'
+
+services:
+  postgres:
+    restart: always
+    # Do not expose PostgreSQL port externally in production
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  redis:
+    restart: always
+    # Do not expose Redis port externally in production
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  api:
+    restart: always
+    environment:
+      NODE_ENV: production
+    # No source bind mounts in production — only built image
+    volumes: []
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1.0'
+
+  worker:
+    restart: always
+    environment:
+      NODE_ENV: production
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1.0'
+    volumes:
+      - report_output:/app/output

@@ -5,11 +5,12 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['src/**/*.spec.ts'],
+    include: ['src/**/*.spec.ts', 'src/**/*.e2e-spec.ts'],
+    testTimeout: 15000,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
-      exclude: ['dist/**', 'node_modules/**', '**/*.spec.ts'],
+      exclude: ['dist/**', 'node_modules/**', '**/*.spec.ts', '**/*.e2e-spec.ts'],
     },
   },
   plugins: [

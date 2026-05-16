@@ -1,1945 +1,2176 @@
-# TASK_PLAN.md — Faz 6: Scheduler & Dağıtım
+# TASK_PLAN.md — Faz 8: Test, Doküman & Deploy
 
-**Üretildi:** 2026-05-15
-**Üreten Ajan:** planner
-**Hedef Faz:** Faz 6 — Scheduler & Dağıtım
-**Durum:** Builder implementasyonu için hazır
-
----
-
-## Genel Bakış
-
-Bu plan; BullMQ tabanlı asenkron rapor kuyruğu, schedule yönetimi modülü, ayrı bir worker uygulaması, e-posta bildirimleri, schedule UI ve Docker/CI-CD altyapısı olmak üzere altı büyük bileşeni kapsar. Adımlar bağımlılık sırasına göre dizilmiştir — builder adım atlayamaz.
-
-### Yeni Paket & Uygulama Listesi
-
-| Bileşen | Tür | Konum |
-|---------|-----|-------|
-| `@datascriba/queue-config` | Shared package | `packages/queue-config/` |
-| `@datascriba/worker` | NestJS app | `apps/worker/` |
-| Schedule module | API modülü | `apps/api/src/modules/schedule/` |
-| Schedule UI | Next.js sayfası | `apps/web/src/app/[locale]/schedules/` |
-| Docker compose | DevOps | `docker/` |
-| GitHub Actions | CI/CD | `.github/workflows/` |
+**Üreten:** planner agent  
+**Tarih:** 2026-05-16  
+**Faz:** 8 — Test, Doküman & Deploy  
+**Okuyacak:** builder, reviewer, tester  
 
 ---
 
-## STEP 1 — Shared Queue Config Paketi
+## Genel Kurallar
 
-**Amaç:** BullMQ bağlantı konfigürasyonunu ve job payload Zod şemasını tüm uygulamalar arasında paylaşmak.
-**Bağımlılıklar:** Yok (ilk adım)
+- KOD YAZARKEN hiç karar alma — bu plan yeterince detaylıdır.
+- Adımları sırayla uygula. Her STEP bağımsız commit olabilir.
+- Mevcut test dosyaları (`parameters.spec.ts`, `csv.renderer.spec.ts`, `excel.renderer.spec.ts`, `crypto.spec.ts`, `query-guard.spec.ts`) ZATEN VAR — üzerine yazma, bırak oldukları gibi.
+- E2E testler gerçek DB/Redis bağlantısı gerektirmez: repository'leri ve driver'ları `vi.fn()` ile mock'la.
+- `console.log` yasak — testlerde de.
+- Coverage hedefi: `packages/` ve `apps/api/` için %80+.
+- Tüm yeni dosyalar `kebab-case` isimlendirilmeli.
 
-### 1.1 — `packages/queue-config/package.json`
+---
 
-```json
-{
-  "name": "@datascriba/queue-config",
-  "version": "0.0.1",
-  "private": true,
-  "license": "Apache-2.0",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
-  "scripts": {
-    "type-check": "tsc --noEmit",
-    "lint": "eslint \"src/**/*.ts\""
-  },
-  "dependencies": {
-    "bullmq": "^5.8.0",
-    "ioredis": "^5.4.1",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "@datascriba/tsconfig": "workspace:*",
-    "@types/node": "^22.10.7",
-    "typescript": "^5.5.4"
+## STEP 1 — Backend Integration Tests: DataSource E2E
+
+**Dosya:** `apps/api/src/modules/data-source/data-source.e2e-spec.ts`
+
+**Strateji:**
+- NestJS `Test.createTestingModule` ile modülü boot et.
+- `DataSourceRepository`'yi mock'la (in-memory store pattern).
+- `DataSourceService.testConnection` içindeki `PoolManager` + `createDriver` çağrısını mock'la.
+- `ENCRYPTION_MASTER_KEY` env'ini test başında set et (`process.env['ENCRYPTION_MASTER_KEY'] = 'a'.repeat(64)`).
+- Supertest ile HTTP isteklerini test et.
+
+**İçerik:**
+
+```typescript
+// apps/api/src/modules/data-source/data-source.e2e-spec.ts
+import { INestApplication, ValidationPipe } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import request from 'supertest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { DataSourceModule } from './data-source.module'
+import { DataSourceRepository } from './data-source.repository'
+
+// Encryption key: 64 hex chars = 32 bytes
+const TEST_KEY = 'a'.repeat(64)
+
+function makeRepoMock() {
+  const store = new Map<string, Record<string, unknown>>()
+  let seq = 0
+
+  return {
+    create: vi.fn(async (data: Record<string, unknown>) => {
+      const id = `ds-${++seq}`
+      const record = { ...data, id, workspaceId: 'default', createdAt: new Date(), updatedAt: new Date() }
+      store.set(id, record)
+      return record
+    }),
+    findAll: vi.fn(async () => [...store.values()]),
+    findById: vi.fn(async (id: string) => store.get(id) ?? null),
+    update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+      const existing = store.get(id)
+      if (!existing) return null
+      const updated = { ...existing, ...patch, updatedAt: new Date() }
+      store.set(id, updated)
+      return updated
+    }),
+    delete: vi.fn(async (id: string) => {
+      const existed = store.has(id)
+      store.delete(id)
+      return existed
+    }),
+    _store: store,
+    _reset: () => { store.clear(); seq = 0 },
   }
 }
-```
 
-### 1.2 — `packages/queue-config/tsconfig.json`
+describe('DataSource E2E', () => {
+  let app: INestApplication
+  let repoMock: ReturnType<typeof makeRepoMock>
 
-```json
-{
-  "$schema": "https://json.schemastore.org/tsconfig",
-  "extends": "@datascriba/tsconfig/base.json",
-  "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": "./src"
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
-}
-```
+  beforeAll(async () => {
+    process.env['ENCRYPTION_MASTER_KEY'] = TEST_KEY
 
-### 1.3 — `packages/queue-config/src/index.ts`
+    repoMock = makeRepoMock()
 
-```typescript
-export { QUEUE_NAME, createQueueOptions, createWorkerOptions } from './queue.config'
-export { RunReportJobSchema, type RunReportJobPayload } from './run-report-job.schema'
-```
+    const module = await Test.createTestingModule({
+      imports: [DataSourceModule],
+    })
+      .overrideProvider(DataSourceRepository)
+      .useValue(repoMock)
+      .compile()
 
-### 1.4 — `packages/queue-config/src/queue.config.ts`
-
-```typescript
-import type { QueueOptions, WorkerOptions } from 'bullmq'
-import Redis from 'ioredis'
-
-export const QUEUE_NAME = 'report-jobs' as const
-
-interface RedisConfig {
-  host: string
-  port: number
-  password?: string
-}
-
-/**
- * Creates a shared IORedis connection instance.
- * Caller is responsible for connection lifecycle.
- */
-export function createRedisConnection(config: RedisConfig): Redis {
-  return new Redis({
-    host: config.host,
-    port: config.port,
-    password: config.password,
-    maxRetriesPerRequest: null, // Required by BullMQ
-    enableReadyCheck: false,    // Required by BullMQ
+    app = module.createNestApplication()
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+    await app.init()
   })
-}
 
-/**
- * BullMQ Queue options — used in apps/api (producer side).
- */
-export function createQueueOptions(config: RedisConfig): QueueOptions {
-  return {
-    connection: createRedisConnection(config),
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 5_000,
-      },
-      removeOnComplete: { count: 100 },
-      removeOnFail: { count: 50 },
-    },
-  }
-}
+  beforeEach(() => {
+    repoMock._reset()
+    vi.clearAllMocks()
+  })
 
-/**
- * BullMQ Worker options — used in apps/worker (consumer side).
- */
-export function createWorkerOptions(config: RedisConfig): WorkerOptions {
-  return {
-    connection: createRedisConnection(config),
-    concurrency: 5,
+  const validPayload = {
+    name: 'Test MSSQL',
+    type: 'mssql',
+    host: 'localhost',
+    port: 1433,
+    database: 'testdb',
+    username: 'sa',
+    password: 'P@ssw0rd',
   }
-}
+
+  describe('POST /data-sources', () => {
+    it('creates a data source and returns 201', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/data-sources')
+        .send(validPayload)
+        .expect(201)
+
+      expect(res.body).toMatchObject({ name: 'Test MSSQL', type: 'mssql' })
+      expect(res.body.id).toBeDefined()
+      expect(res.body.encryptedConnectionString).toBe('[REDACTED]')
+    })
+
+    it('returns 400 when required fields are missing', async () => {
+      await request(app.getHttpServer())
+        .post('/data-sources')
+        .send({ name: 'incomplete' })
+        .expect(400)
+    })
+  })
+
+  describe('GET /data-sources', () => {
+    it('returns empty array when no data sources exist', async () => {
+      const res = await request(app.getHttpServer())
+        .get('/data-sources')
+        .expect(200)
+
+      expect(Array.isArray(res.body)).toBe(true)
+      expect(res.body).toHaveLength(0)
+    })
+
+    it('returns created data sources', async () => {
+      await request(app.getHttpServer()).post('/data-sources').send(validPayload)
+
+      const res = await request(app.getHttpServer())
+        .get('/data-sources')
+        .expect(200)
+
+      expect(res.body).toHaveLength(1)
+      expect(res.body[0].name).toBe('Test MSSQL')
+    })
+  })
+
+  describe('GET /data-sources/:id', () => {
+    it('returns 200 for existing data source', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/data-sources')
+        .send(validPayload)
+
+      const id = created.body.id as string
+
+      const res = await request(app.getHttpServer())
+        .get(`/data-sources/${id}`)
+        .expect(200)
+
+      expect(res.body.id).toBe(id)
+    })
+
+    it('returns 404 for non-existent id', async () => {
+      await request(app.getHttpServer())
+        .get('/data-sources/nonexistent-id')
+        .expect(404)
+    })
+  })
+
+  describe('PATCH /data-sources/:id', () => {
+    it('updates name and returns updated record', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/data-sources')
+        .send(validPayload)
+
+      const id = created.body.id as string
+
+      const res = await request(app.getHttpServer())
+        .patch(`/data-sources/${id}`)
+        .send({ name: 'Updated Name' })
+        .expect(200)
+
+      expect(res.body.name).toBe('Updated Name')
+    })
+
+    it('returns 404 when updating non-existent data source', async () => {
+      await request(app.getHttpServer())
+        .patch('/data-sources/ghost')
+        .send({ name: 'X' })
+        .expect(404)
+    })
+  })
+
+  describe('DELETE /data-sources/:id', () => {
+    it('deletes existing data source and returns 204', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/data-sources')
+        .send(validPayload)
+
+      const id = created.body.id as string
+
+      await request(app.getHttpServer())
+        .delete(`/data-sources/${id}`)
+        .expect(204)
+
+      await request(app.getHttpServer())
+        .get(`/data-sources/${id}`)
+        .expect(404)
+    })
+
+    it('returns 404 when deleting non-existent data source', async () => {
+      await request(app.getHttpServer())
+        .delete('/data-sources/ghost')
+        .expect(404)
+    })
+  })
+
+  describe('POST /data-sources/:id/test', () => {
+    it('endpoint is reachable (returns 200, 500, or 503 — not 404/405)', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/data-sources')
+        .send(validPayload)
+
+      const id = created.body.id as string
+
+      const res = await request(app.getHttpServer())
+        .post(`/data-sources/${id}/test`)
+
+      expect([200, 500, 503]).toContain(res.status)
+    })
+  })
+})
 ```
 
-### 1.5 — `packages/queue-config/src/run-report-job.schema.ts`
+**Notlar:**
+- `supertest` package yoksa: `pnpm add -D supertest @types/supertest --filter=api`
+- `DataSourceModule`'un `ConfigModule` bağımlılığı varsa mock'la: `.overrideProvider(ConfigService).useValue({ get: vi.fn() })`
+
+---
+
+## STEP 2 — Backend Integration Tests: Report E2E
+
+**Dosya:** `apps/api/src/modules/report/report.e2e-spec.ts`
+
+**Strateji:**
+- `ReportRepository` ve `DataSourceService` mock'la.
+- `DataSourceService.executeQuery` → sabit `QueryResult` döndür.
+- `renderReport` fonksiyonunu `vi.mock('@datascriba/report-engine', ...)` ile mock'la.
+- File system (`fs.writeFileSync`) mock'la: `vi.mock('node:fs', ...)`.
+
+**İçerik:**
 
 ```typescript
-import { z } from 'zod'
+// apps/api/src/modules/report/report.e2e-spec.ts
+import { INestApplication, ValidationPipe } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import request from 'supertest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-/**
- * Type-safe payload for the RunReport BullMQ job.
- * Both API (producer) and Worker (consumer) import this schema.
- */
-export const RunReportJobSchema = z.object({
-  scheduleId: z.string().uuid(),
-  reportId: z.string().uuid(),
-  format: z.enum(['csv', 'excel']),
-  parameters: z.record(z.string(), z.unknown()).default({}),
-  notifyEmail: z.string().email().optional(),
-  triggeredBy: z.enum(['scheduler', 'manual']),
-  triggeredAt: z.string().datetime(),
+// Mock report-engine before importing the module
+vi.mock('@datascriba/report-engine', () => ({
+  renderReport: vi.fn(async () => Buffer.from('fake-output')),
+  renderTemplate: vi.fn((sql: string) => sql),
+  validateParameters: vi.fn((_params: unknown, values: Record<string, unknown>) => values),
+}))
+
+// Mock node:fs to avoid actual file writes
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return {
+    ...actual,
+    existsSync: vi.fn(() => true),
+    mkdirSync: vi.fn(),
+    writeFileSync: vi.fn(),
+  }
 })
 
-export type RunReportJobPayload = z.infer<typeof RunReportJobSchema>
-```
-
----
-
-## STEP 2 — Shared Types Guncellemesi
-
-**Amaç:** `packages/shared-types`'a schedule domaine ait tipleri eklemek.
-**Bağımlılıklar:** STEP 1
-
-### 2.1 — `packages/shared-types/src/schedule.ts` (YENİ DOSYA)
-
-```typescript
-import type { ExportFormat } from './report'
-
-export interface ScheduleDefinition {
-  id: string
-  reportId: string
-  cronExpression: string
-  format: ExportFormat
-  parameters: Record<string, unknown>
-  enabled: boolean
-  notifyEmail?: string
-  lastRunAt?: Date
-  nextRunAt?: Date
-  createdAt: Date
-  updatedAt: Date
-}
-
-export interface CreateScheduleRequest {
-  reportId: string
-  cronExpression: string
-  format: ExportFormat
-  parameters?: Record<string, unknown>
-  notifyEmail?: string
-  enabled?: boolean
-}
-
-export interface UpdateScheduleRequest {
-  cronExpression?: string
-  format?: ExportFormat
-  parameters?: Record<string, unknown>
-  notifyEmail?: string
-  enabled?: boolean
-}
-```
-
-### 2.2 — `packages/shared-types/src/index.ts` (GUNCELLE)
-
-Mevcut dosyaya tek satir ekle — diger satirlara dokunma:
-
-```typescript
-export type { ApiResponse, PaginatedResponse } from './common'
-export type {
-  DataSourceType,
-  TableMeta,
-  ColumnMeta,
-  Row,
-  QueryResult,
-  DataSourceRecord,
-} from './data-source'
-export type {
-  ExportFormat,
-  ReportParameterType,
-  ReportParameter,
-  ReportDefinition,
-  RunStatus,
-  RunRecord,
-} from './report'
-export type {
-  SuggestQueryBody,
-  ExplainQueryBody,
-  FixQueryBody,
-  ExplainQueryResponse,
-  AiSseChunk,
-} from './ai'
-// Faz 6 — Schedule types
-export type {
-  ScheduleDefinition,
-  CreateScheduleRequest,
-  UpdateScheduleRequest,
-} from './schedule'
-```
-
----
-
-## STEP 3 — API: Schedule Modülü
-
-**Amaç:** `POST /schedules`, `GET /schedules`, `GET /schedules/:id`, `PUT /schedules/:id`, `DELETE /schedules/:id`, `POST /schedules/:id/trigger` endpoint'lerini saglamak ve cron scheduler'i entegre etmek.
-**Bağımlılıklar:** STEP 1, STEP 2
-
-### 3.1 — API'ye Yeni Bagımlılıklar
-
-`apps/api/package.json` dosyasının `dependencies` bölümüne ekle:
-
-```json
-"@datascriba/queue-config": "workspace:*",
-"@nestjs/bullmq": "^10.2.3",
-"@nestjs/schedule": "^4.1.0",
-"bullmq": "^5.8.0",
-"cron-parser": "^4.9.0",
-"handlebars": "^4.7.8",
-"ioredis": "^5.4.1",
-"nodemailer": "^6.9.14"
-```
-
-`apps/api/package.json` dosyasının `devDependencies` bölümüne ekle:
-
-```json
-"@types/nodemailer": "^6.4.17"
-```
-
-**Not:** `@nestjs/bullmq` kullan — `@nestjs/bull` değil. BullMQ v5 ile native uyumlu olan paket budur.
-
-### 3.2 — Env Guncellemesi: `apps/api/src/config/env.ts` (GUNCELLE)
-
-Mevcut `envSchema`'ya su alanları ekle (digerlerine dokunma):
-
-```typescript
-// Queue / Redis
-REDIS_HOST: z.string().default('127.0.0.1'),
-REDIS_PORT: z.coerce.number().int().min(1).max(65535).default(6379),
-REDIS_PASSWORD: z.string().optional(),
-
-// SMTP (optional — e-posta bildirim ozelligi)
-SMTP_HOST: z.string().optional(),
-SMTP_PORT: z.coerce.number().int().default(587),
-SMTP_USER: z.string().optional(),
-SMTP_PASS: z.string().optional(),
-SMTP_FROM: z.string().email().optional(),
-```
-
-Ayrica `Env` tipini disariya aktaran `env` sabit nesnesinin fallback kismini da guncelle:
-
-```typescript
-REDIS_HOST: process.env['REDIS_HOST'] ?? '127.0.0.1',
-REDIS_PORT: 6379,
-REDIS_PASSWORD: process.env['REDIS_PASSWORD'],
-SMTP_HOST: process.env['SMTP_HOST'],
-SMTP_PORT: 587,
-SMTP_USER: process.env['SMTP_USER'],
-SMTP_PASS: process.env['SMTP_PASS'],
-SMTP_FROM: process.env['SMTP_FROM'],
-```
-
-### 3.3 — `apps/api/src/modules/schedule/dto/create-schedule.dto.ts`
-
-```typescript
-import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger'
-import { IsBoolean, IsEmail, IsIn, IsObject, IsOptional, IsString, IsUUID, MinLength } from 'class-validator'
-
-export class CreateScheduleDto {
-  @ApiProperty({ description: 'Report ID to schedule', example: 'uuid' })
-  @IsUUID()
-  reportId!: string
-
-  @ApiProperty({ description: 'Cron expression (5-part)', example: '0 8 * * 1-5' })
-  @IsString()
-  @MinLength(9)
-  cronExpression!: string
-
-  @ApiProperty({ description: 'Export format', enum: ['csv', 'excel'] })
-  @IsIn(['csv', 'excel'])
-  format!: 'csv' | 'excel'
-
-  @ApiPropertyOptional({ description: 'Report parameters' })
-  @IsOptional()
-  @IsObject()
-  parameters?: Record<string, unknown>
-
-  @ApiPropertyOptional({ description: 'E-mail for delivery notification' })
-  @IsOptional()
-  @IsEmail()
-  notifyEmail?: string
-
-  @ApiPropertyOptional({ description: 'Start enabled', default: true })
-  @IsOptional()
-  @IsBoolean()
-  enabled?: boolean
-}
-```
-
-### 3.4 — `apps/api/src/modules/schedule/dto/update-schedule.dto.ts`
-
-```typescript
-import { ApiPropertyOptional } from '@nestjs/swagger'
-import { IsBoolean, IsEmail, IsIn, IsObject, IsOptional, IsString, MinLength } from 'class-validator'
-
-export class UpdateScheduleDto {
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
-  @MinLength(9)
-  cronExpression?: string
-
-  @ApiPropertyOptional({ enum: ['csv', 'excel'] })
-  @IsOptional()
-  @IsIn(['csv', 'excel'])
-  format?: 'csv' | 'excel'
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsObject()
-  parameters?: Record<string, unknown>
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsEmail()
-  notifyEmail?: string
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsBoolean()
-  enabled?: boolean
-}
-```
-
-### 3.5 — `apps/api/src/modules/schedule/schedule.repository.ts`
-
-```typescript
-import { Injectable } from '@nestjs/common'
-import type { ScheduleDefinition } from '@datascriba/shared-types'
-
-/**
- * Phase 6 stub: in-memory schedule store.
- * A future phase replaces this with Prisma.
- */
-@Injectable()
-export class ScheduleRepository {
-  private readonly store = new Map<string, ScheduleDefinition>()
-
-  async findAll(): Promise<ScheduleDefinition[]> {
-    return [...this.store.values()]
-  }
-
-  async findById(id: string): Promise<ScheduleDefinition | null> {
-    return this.store.get(id) ?? null
-  }
-
-  async findEnabled(): Promise<ScheduleDefinition[]> {
-    return [...this.store.values()].filter((s) => s.enabled)
-  }
-
-  async create(
-    data: Omit<ScheduleDefinition, 'id' | 'createdAt' | 'updatedAt'>,
-  ): Promise<ScheduleDefinition> {
-    const id = crypto.randomUUID()
-    const now = new Date()
-    const record: ScheduleDefinition = { ...data, id, createdAt: now, updatedAt: now }
-    this.store.set(id, record)
-    return record
-  }
-
-  async update(
-    id: string,
-    patch: Partial<Omit<ScheduleDefinition, 'id' | 'createdAt'>>,
-  ): Promise<ScheduleDefinition | null> {
-    const existing = this.store.get(id)
-    if (!existing) return null
-    const updated: ScheduleDefinition = { ...existing, ...patch, updatedAt: new Date() }
-    this.store.set(id, updated)
-    return updated
-  }
-
-  async delete(id: string): Promise<boolean> {
-    return this.store.delete(id)
-  }
-}
-```
-
-### 3.6 — `apps/api/src/modules/schedule/schedule.service.ts`
-
-```typescript
-import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common'
-import { InjectQueue } from '@nestjs/bullmq'
-import { Cron } from '@nestjs/schedule'
-import type { Queue } from 'bullmq'
-import cronParser from 'cron-parser'
-import type { ScheduleDefinition } from '@datascriba/shared-types'
-import { QUEUE_NAME, type RunReportJobPayload } from '@datascriba/queue-config'
-
-import type { CreateScheduleDto } from './dto/create-schedule.dto'
-import type { UpdateScheduleDto } from './dto/update-schedule.dto'
-import { ScheduleRepository } from './schedule.repository'
-
-@Injectable()
-export class ScheduleService {
-  private readonly logger = new Logger(ScheduleService.name)
-
-  constructor(
-    private readonly repository: ScheduleRepository,
-    @InjectQueue(QUEUE_NAME) private readonly reportQueue: Queue,
-  ) {}
-
-  /** Validate cron expression using cron-parser */
-  private validateCron(expression: string): void {
-    try {
-      cronParser.parseExpression(expression)
-    } catch {
-      throw new BadRequestException(`Invalid cron expression: "${expression}"`)
-    }
-  }
-
-  /** Compute next run date for a cron expression */
-  private computeNextRun(expression: string): Date {
-    const interval = cronParser.parseExpression(expression)
-    return interval.next().toDate()
-  }
-
-  async create(dto: CreateScheduleDto): Promise<ScheduleDefinition> {
-    this.validateCron(dto.cronExpression)
-    const nextRunAt = this.computeNextRun(dto.cronExpression)
-
-    const schedule = await this.repository.create({
-      reportId: dto.reportId,
-      cronExpression: dto.cronExpression,
-      format: dto.format,
-      parameters: dto.parameters ?? {},
-      enabled: dto.enabled ?? true,
-      notifyEmail: dto.notifyEmail,
-      nextRunAt,
-      lastRunAt: undefined,
-    })
-
-    this.logger.log({ scheduleId: schedule.id, reportId: dto.reportId }, 'Schedule created')
-    return schedule
-  }
-
-  async findAll(): Promise<ScheduleDefinition[]> {
-    return this.repository.findAll()
-  }
-
-  async findOne(id: string): Promise<ScheduleDefinition> {
-    const schedule = await this.repository.findById(id)
-    if (!schedule) throw new NotFoundException(`Schedule '${id}' not found`)
-    return schedule
-  }
-
-  async update(id: string, dto: UpdateScheduleDto): Promise<ScheduleDefinition> {
-    await this.findOne(id) // 404 guard
-
-    if (dto.cronExpression !== undefined) {
-      this.validateCron(dto.cronExpression)
-    }
-
-    const patch: Partial<ScheduleDefinition> = { ...dto }
-    if (dto.cronExpression !== undefined) {
-      patch.nextRunAt = this.computeNextRun(dto.cronExpression)
-    }
-
-    const updated = await this.repository.update(id, patch)
-    if (!updated) throw new NotFoundException(`Schedule '${id}' not found`)
-
-    this.logger.log({ scheduleId: id }, 'Schedule updated')
-    return updated
-  }
-
-  async remove(id: string): Promise<void> {
-    await this.findOne(id) // 404 guard
-    const deleted = await this.repository.delete(id)
-    if (!deleted) throw new NotFoundException(`Schedule '${id}' not found`)
-    this.logger.log({ scheduleId: id }, 'Schedule deleted')
-  }
-
-  async trigger(id: string): Promise<{ jobId: string }> {
-    const schedule = await this.findOne(id)
-    const payload: RunReportJobPayload = {
-      scheduleId: schedule.id,
-      reportId: schedule.reportId,
-      format: schedule.format,
-      parameters: schedule.parameters,
-      notifyEmail: schedule.notifyEmail,
-      triggeredBy: 'manual',
-      triggeredAt: new Date().toISOString(),
-    }
-    const job = await this.reportQueue.add('run-report', payload)
-    this.logger.log({ scheduleId: id, jobId: job.id }, 'Schedule manually triggered')
-    return { jobId: String(job.id) }
-  }
-
-  /**
-   * Runs every minute. Checks all enabled schedules and enqueues jobs
-   * whose nextRunAt is in the past.
-   */
-  @Cron('* * * * *')
-  async dispatchDueSchedules(): Promise<void> {
-    const enabledSchedules = await this.repository.findEnabled()
-    const now = new Date()
-
-    for (const schedule of enabledSchedules) {
-      if (schedule.nextRunAt === undefined || schedule.nextRunAt > now) continue
-
-      const payload: RunReportJobPayload = {
-        scheduleId: schedule.id,
-        reportId: schedule.reportId,
-        format: schedule.format,
-        parameters: schedule.parameters,
-        notifyEmail: schedule.notifyEmail,
-        triggeredBy: 'scheduler',
-        triggeredAt: now.toISOString(),
+import { DataSourceService } from '../data-source/data-source.service'
+import { ReportModule } from './report.module'
+import { ReportRepository } from './report.repository'
+
+const TEST_KEY = 'a'.repeat(64)
+
+function makeReportRepoMock() {
+  const reportStore = new Map<string, Record<string, unknown>>()
+  const runStore = new Map<string, Record<string, unknown>>()
+  let seq = 0
+
+  return {
+    create: vi.fn(async (data: Record<string, unknown>) => {
+      const id = `rpt-${++seq}`
+      const record = {
+        ...data,
+        id,
+        version: 1,
+        createdBy: 'system',
+        workspaceId: 'default',
+        createdAt: new Date(),
+        updatedAt: new Date(),
       }
-
-      try {
-        const job = await this.reportQueue.add('run-report', payload)
-        const nextRunAt = this.computeNextRun(schedule.cronExpression)
-        await this.repository.update(schedule.id, {
-          lastRunAt: now,
-          nextRunAt,
-        })
-        this.logger.log(
-          { scheduleId: schedule.id, jobId: job.id, nextRunAt },
-          'Dispatched scheduled report job',
-        )
-      } catch (err: unknown) {
-        this.logger.error({ scheduleId: schedule.id, err }, 'Failed to dispatch schedule job')
-      }
-    }
-  }
-}
-```
-
-### 3.7 — `apps/api/src/modules/schedule/schedule.controller.ts`
-
-```typescript
-import {
-  Body,
-  Controller,
-  Delete,
-  Get,
-  HttpCode,
-  HttpStatus,
-  Param,
-  Post,
-  Put,
-} from '@nestjs/common'
-import {
-  ApiBody,
-  ApiCreatedResponse,
-  ApiNoContentResponse,
-  ApiNotFoundResponse,
-  ApiOkResponse,
-  ApiOperation,
-  ApiParam,
-  ApiTags,
-} from '@nestjs/swagger'
-import type { ScheduleDefinition } from '@datascriba/shared-types'
-
-import { CreateScheduleDto } from './dto/create-schedule.dto'
-import { UpdateScheduleDto } from './dto/update-schedule.dto'
-import { ScheduleService } from './schedule.service'
-
-@ApiTags('Schedules')
-@Controller('schedules')
-export class ScheduleController {
-  constructor(private readonly service: ScheduleService) {}
-
-  @Post()
-  @ApiOperation({ summary: 'Create a new schedule' })
-  @ApiBody({ type: CreateScheduleDto })
-  @ApiCreatedResponse({ description: 'Schedule created' })
-  async create(@Body() dto: CreateScheduleDto): Promise<ScheduleDefinition> {
-    return this.service.create(dto)
-  }
-
-  @Get()
-  @ApiOperation({ summary: 'List all schedules' })
-  @ApiOkResponse({ description: 'List of schedules' })
-  async findAll(): Promise<ScheduleDefinition[]> {
-    return this.service.findAll()
-  }
-
-  @Get(':id')
-  @ApiOperation({ summary: 'Get a schedule by ID' })
-  @ApiParam({ name: 'id', type: String })
-  @ApiNotFoundResponse({ description: 'Schedule not found' })
-  async findOne(@Param('id') id: string): Promise<ScheduleDefinition> {
-    return this.service.findOne(id)
-  }
-
-  @Put(':id')
-  @ApiOperation({ summary: 'Update a schedule' })
-  @ApiParam({ name: 'id', type: String })
-  @ApiBody({ type: UpdateScheduleDto })
-  @ApiNotFoundResponse({ description: 'Schedule not found' })
-  async update(
-    @Param('id') id: string,
-    @Body() dto: UpdateScheduleDto,
-  ): Promise<ScheduleDefinition> {
-    return this.service.update(id, dto)
-  }
-
-  @Delete(':id')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a schedule' })
-  @ApiParam({ name: 'id', type: String })
-  @ApiNoContentResponse({ description: 'Schedule deleted' })
-  async remove(@Param('id') id: string): Promise<void> {
-    return this.service.remove(id)
-  }
-
-  @Post(':id/trigger')
-  @ApiOperation({ summary: 'Manually trigger a schedule (enqueue job)' })
-  @ApiParam({ name: 'id', type: String })
-  @ApiOkResponse({ description: 'Job enqueued', schema: { properties: { jobId: { type: 'string' } } } })
-  async trigger(@Param('id') id: string): Promise<{ jobId: string }> {
-    return this.service.trigger(id)
-  }
-}
-```
-
-### 3.8 — `apps/api/src/modules/schedule/email.service.ts`
-
-```typescript
-import { Injectable, Logger } from '@nestjs/common'
-import { ConfigService } from '@nestjs/config'
-import * as nodemailer from 'nodemailer'
-import Handlebars from 'handlebars'
-import type { Env } from '../../config/env'
-
-interface ReportEmailOptions {
-  to: string
-  reportName: string
-  ranAt: Date
-  format: 'csv' | 'excel'
-  attachment: {
-    filename: string
-    content: Buffer
+      reportStore.set(id, record)
+      return record
+    }),
+    findAll: vi.fn(async () => [...reportStore.values()]),
+    findById: vi.fn(async (id: string) => reportStore.get(id) ?? null),
+    update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+      const existing = reportStore.get(id)
+      if (!existing) return null
+      const updated = { ...existing, ...patch, updatedAt: new Date() }
+      reportStore.set(id, updated)
+      return updated
+    }),
+    delete: vi.fn(async (id: string) => {
+      const existed = reportStore.has(id)
+      reportStore.delete(id)
+      return existed
+    }),
+    createRun: vi.fn(async (run: Record<string, unknown>) => {
+      runStore.set(run['id'] as string, run)
+      return run
+    }),
+    updateRun: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+      const existing = runStore.get(id)
+      if (!existing) return null
+      const updated = { ...existing, ...patch }
+      runStore.set(id, updated)
+      return updated
+    }),
+    findRunsByReportId: vi.fn(async (reportId: string) =>
+      [...runStore.values()].filter((r) => r['reportId'] === reportId),
+    ),
+    findRunById: vi.fn(async (id: string) => runStore.get(id) ?? null),
+    _reportStore: reportStore,
+    _runStore: runStore,
+    _reset: () => { reportStore.clear(); runStore.clear(); seq = 0 },
   }
 }
 
-// Inline HTML template — avoids filesystem reads at runtime
-const EMAIL_TEMPLATE_SOURCE = `
-<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>DataScriba Report</title></head>
-<body style="font-family:Inter,sans-serif;color:#0F172A;max-width:600px;margin:auto;padding:24px">
-  <h1 style="color:#6366F1;margin-bottom:4px">DataScriba</h1>
-  <p style="color:#64748b;margin-top:0">Your AI-powered data scribe</p>
-  <hr style="border:none;border-top:1px solid #E2E8F0;margin:24px 0">
-  <h2>Report Ready: {{reportName}}</h2>
-  <p>Your scheduled report has been generated and is attached to this e-mail.</p>
-  <table style="border-collapse:collapse;width:100%">
-    <tr>
-      <td style="padding:8px 0;color:#64748b;width:140px">Report Name</td>
-      <td style="padding:8px 0;font-weight:600">{{reportName}}</td>
-    </tr>
-    <tr>
-      <td style="padding:8px 0;color:#64748b">Generated At</td>
-      <td style="padding:8px 0">{{ranAt}}</td>
-    </tr>
-    <tr>
-      <td style="padding:8px 0;color:#64748b">Format</td>
-      <td style="padding:8px 0;text-transform:uppercase">{{format}}</td>
-    </tr>
-  </table>
-  <hr style="border:none;border-top:1px solid #E2E8F0;margin:24px 0">
-  <p style="color:#94a3b8;font-size:12px">
-    This is an automated message from DataScriba. Do not reply to this e-mail.
-  </p>
-</body>
-</html>
-`
-
-@Injectable()
-export class EmailService {
-  private readonly logger = new Logger(EmailService.name)
-  private readonly template: HandlebarsTemplateDelegate
-  private readonly transporter: nodemailer.Transporter | null = null
-
-  constructor(private readonly config: ConfigService<Env, true>) {
-    this.template = Handlebars.compile(EMAIL_TEMPLATE_SOURCE)
-
-    const smtpHost = config.get('SMTP_HOST', { infer: true })
-    if (smtpHost) {
-      this.transporter = nodemailer.createTransport({
-        host: smtpHost,
-        port: config.get('SMTP_PORT', { infer: true }),
-        secure: false,
-        auth: {
-          user: config.get('SMTP_USER', { infer: true }),
-          pass: config.get('SMTP_PASS', { infer: true }),
-        },
-      })
-    }
-  }
-
-  async sendReportEmail(options: ReportEmailOptions): Promise<void> {
-    if (!this.transporter) {
-      this.logger.warn('SMTP not configured — skipping email notification')
-      return
-    }
-
-    const html = this.template({
-      reportName: options.reportName,
-      ranAt: options.ranAt.toISOString(),
-      format: options.format,
-    })
-
-    const mimeType =
-      options.format === 'excel'
-        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        : 'text/csv'
-
-    const from = this.config.get('SMTP_FROM', { infer: true })
-
-    await this.transporter.sendMail({
-      from: from ?? 'no-reply@datascriba.io',
-      to: options.to,
-      subject: `[DataScriba] Report Ready: ${options.reportName}`,
-      html,
-      attachments: [
-        {
-          filename: options.attachment.filename,
-          content: options.attachment.content,
-          contentType: mimeType,
-        },
+function makeDataSourceServiceMock() {
+  return {
+    executeQuery: vi.fn(async () => ({
+      columns: [
+        { name: 'id', dataType: 'int', nullable: false, isPrimaryKey: true, defaultValue: null },
+        { name: 'name', dataType: 'varchar', nullable: true, isPrimaryKey: false, defaultValue: null },
       ],
-    })
-
-    this.logger.log({ to: options.to, reportName: options.reportName }, 'Report email sent')
+      rows: [{ id: 1, name: 'Alice' }],
+      rowCount: 1,
+    })),
+    findOne: vi.fn(async (id: string) => ({ id, name: 'Mock DS', type: 'mssql' })),
+    listTables: vi.fn(async () => []),
+    describeTable: vi.fn(async () => []),
   }
 }
+
+describe('Report E2E', () => {
+  let app: INestApplication
+  let repoMock: ReturnType<typeof makeReportRepoMock>
+  let dsMock: ReturnType<typeof makeDataSourceServiceMock>
+
+  const validReportPayload = {
+    name: 'Monthly Sales',
+    dataSourceId: 'ds-1',
+    query: 'SELECT id, name FROM sales',
+    exportFormats: ['csv'],
+    parameters: [],
+  }
+
+  beforeAll(async () => {
+    process.env['ENCRYPTION_MASTER_KEY'] = TEST_KEY
+
+    repoMock = makeReportRepoMock()
+    dsMock = makeDataSourceServiceMock()
+
+    const module = await Test.createTestingModule({
+      imports: [ReportModule],
+    })
+      .overrideProvider(ReportRepository)
+      .useValue(repoMock)
+      .overrideProvider(DataSourceService)
+      .useValue(dsMock)
+      .compile()
+
+    app = module.createNestApplication()
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+    await app.init()
+  })
+
+  beforeEach(() => {
+    repoMock._reset()
+    vi.clearAllMocks()
+  })
+
+  describe('POST /reports', () => {
+    it('creates a report and returns 201', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+        .expect(201)
+
+      expect(res.body.name).toBe('Monthly Sales')
+      expect(res.body.id).toBeDefined()
+    })
+
+    it('returns 400 when name is missing', async () => {
+      await request(app.getHttpServer())
+        .post('/reports')
+        .send({ dataSourceId: 'ds-1', query: 'SELECT 1', exportFormats: ['csv'] })
+        .expect(400)
+    })
+  })
+
+  describe('GET /reports', () => {
+    it('returns empty array initially', async () => {
+      const res = await request(app.getHttpServer()).get('/reports').expect(200)
+      expect(res.body).toHaveLength(0)
+    })
+
+    it('returns list after creation', async () => {
+      await request(app.getHttpServer()).post('/reports').send(validReportPayload)
+      const res = await request(app.getHttpServer()).get('/reports').expect(200)
+      expect(res.body).toHaveLength(1)
+    })
+  })
+
+  describe('GET /reports/:id', () => {
+    it('returns 404 for unknown id', async () => {
+      await request(app.getHttpServer()).get('/reports/nonexistent').expect(404)
+    })
+
+    it('returns report for valid id', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      await request(app.getHttpServer())
+        .get(`/reports/${created.body.id}`)
+        .expect(200)
+    })
+  })
+
+  describe('PATCH /reports/:id', () => {
+    it('updates report name', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      const res = await request(app.getHttpServer())
+        .patch(`/reports/${created.body.id}`)
+        .send({ name: 'Updated Report' })
+        .expect(200)
+
+      expect(res.body.name).toBe('Updated Report')
+    })
+  })
+
+  describe('DELETE /reports/:id', () => {
+    it('deletes a report and returns 204', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      await request(app.getHttpServer())
+        .delete(`/reports/${created.body.id}`)
+        .expect(204)
+    })
+  })
+
+  describe('POST /reports/:id/run', () => {
+    it('runs a report and returns file buffer with correct content-type', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      const id = created.body.id as string
+
+      const res = await request(app.getHttpServer())
+        .post(`/reports/${id}/run`)
+        .send({ format: 'csv', parameters: {} })
+        .expect(200)
+
+      expect(res.headers['content-type']).toMatch(/text\/csv/)
+    })
+
+    it('returns 404 when report does not exist', async () => {
+      await request(app.getHttpServer())
+        .post('/reports/ghost/run')
+        .send({ format: 'csv' })
+        .expect(404)
+    })
+
+    it('returns 400 for invalid format', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      await request(app.getHttpServer())
+        .post(`/reports/${created.body.id}/run`)
+        .send({ format: 'pdf' })
+        .expect(400)
+    })
+  })
+
+  describe('GET /reports/:id/runs', () => {
+    it('returns run history after a run', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/reports')
+        .send(validReportPayload)
+
+      const id = created.body.id as string
+
+      await request(app.getHttpServer())
+        .post(`/reports/${id}/run`)
+        .send({ format: 'csv' })
+
+      const res = await request(app.getHttpServer())
+        .get(`/reports/${id}/runs`)
+        .expect(200)
+
+      expect(Array.isArray(res.body)).toBe(true)
+      expect(res.body.length).toBeGreaterThanOrEqual(1)
+    })
+  })
+})
 ```
 
-### 3.9 — `apps/api/src/modules/schedule/schedule.module.ts`
+---
+
+## STEP 3 — Backend Integration Tests: Schedule E2E
+
+**Dosya:** `apps/api/src/modules/schedule/schedule.e2e-spec.ts`
+
+**Strateji:**
+- `ScheduleRepository` mock'la.
+- BullMQ `Queue` (inject token `QUEUE_NAME`) mock'la — `add` metodu `{ id: 'job-1' }` döndürsün.
+- `getQueueToken(QUEUE_NAME)` ile inject token'ı override et.
+
+**İçerik:**
 
 ```typescript
-import { BullMQModule } from '@nestjs/bullmq'
-import { Module } from '@nestjs/common'
+// apps/api/src/modules/schedule/schedule.e2e-spec.ts
+import { INestApplication, ValidationPipe } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import { getQueueToken } from '@nestjs/bullmq'
 import { QUEUE_NAME } from '@datascriba/queue-config'
+import request from 'supertest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ReportModule } from '../report/report.module'
-
-import { EmailService } from './email.service'
-import { ScheduleController } from './schedule.controller'
+import { ScheduleModule } from './schedule.module'
 import { ScheduleRepository } from './schedule.repository'
-import { ScheduleService } from './schedule.service'
 
-@Module({
-  imports: [
-    BullMQModule.registerQueue({ name: QUEUE_NAME }),
-    ReportModule,
-  ],
-  controllers: [ScheduleController],
-  providers: [ScheduleService, ScheduleRepository, EmailService],
-  exports: [ScheduleService, EmailService],
-})
-export class ScheduleModule {}
-```
+function makeScheduleRepoMock() {
+  const store = new Map<string, Record<string, unknown>>()
+  let seq = 0
 
-### 3.10 — `apps/api/src/app.module.ts` (TAM GUNCELLENMIS HAL)
-
-```typescript
-import { Module } from '@nestjs/common'
-import { ConfigModule, ConfigService } from '@nestjs/config'
-import { APP_FILTER } from '@nestjs/core'
-import { ThrottlerModule } from '@nestjs/throttler'
-import { BullMQModule } from '@nestjs/bullmq'
-import { ScheduleModule as NestScheduleModule } from '@nestjs/schedule'
-import { createQueueOptions } from '@datascriba/queue-config'
-
-import { AppController } from './app.controller'
-import { AppService } from './app.service'
-import { AppExceptionFilter } from './common/filters/app-exception.filter'
-import type { Env } from './config/env'
-import { AiModule } from './modules/ai/ai.module'
-import { DataSourceModule } from './modules/data-source/data-source.module'
-import { ReportModule } from './modules/report/report.module'
-import { ScheduleModule } from './modules/schedule/schedule.module'
-import { HealthController } from './health/health.controller'
-
-@Module({
-  imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-      envFilePath: ['.env.local', '.env'],
+  return {
+    create: vi.fn(async (data: Record<string, unknown>) => {
+      const id = `sch-${++seq}`
+      const record = { ...data, id, createdAt: new Date(), updatedAt: new Date() }
+      store.set(id, record)
+      return record
     }),
-    ThrottlerModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService<Env, true>) => [
-        {
-          name: 'ai',
-          ttl: 60_000,
-          limit: config.get('AI_RATE_LIMIT_RPM'),
-        },
-      ],
+    findAll: vi.fn(async () => [...store.values()]),
+    findById: vi.fn(async (id: string) => store.get(id) ?? null),
+    findEnabled: vi.fn(async () => [...store.values()].filter((s) => s['enabled'] === true)),
+    update: vi.fn(async (id: string, patch: Record<string, unknown>) => {
+      const existing = store.get(id)
+      if (!existing) return null
+      const updated = { ...existing, ...patch, updatedAt: new Date() }
+      store.set(id, updated)
+      return updated
     }),
-    NestScheduleModule.forRoot(),
-    BullMQModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService<Env, true>) =>
-        createQueueOptions({
-          host: config.get('REDIS_HOST'),
-          port: config.get('REDIS_PORT'),
-          password: config.get('REDIS_PASSWORD'),
-        }),
+    delete: vi.fn(async (id: string) => {
+      const existed = store.has(id)
+      store.delete(id)
+      return existed
     }),
-    DataSourceModule,
-    ReportModule,
-    AiModule,
-    ScheduleModule,
-  ],
-  controllers: [AppController, HealthController],
-  providers: [
-    AppService,
-    {
-      provide: APP_FILTER,
-      useClass: AppExceptionFilter,
-    },
-  ],
-})
-export class AppModule {}
-```
-
----
-
-## STEP 4 — Worker Uygulaması (apps/worker)
-
-**Amaç:** BullMQ'daki `report-jobs` kuyruğunu tüketen ayri NestJS uygulamasi olusturmak.
-**Bagımlılıklar:** STEP 1, STEP 3 (queue-config paketi hazir olmali)
-
-### 4.1 — `apps/worker/package.json`
-
-```json
-{
-  "name": "@datascriba/worker",
-  "version": "0.0.1",
-  "private": true,
-  "license": "Apache-2.0",
-  "scripts": {
-    "build": "nest build",
-    "dev": "nest start --watch",
-    "start": "node dist/main",
-    "start:prod": "NODE_ENV=production node dist/main",
-    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
-    "lint:check": "eslint \"{src,test}/**/*.ts\"",
-    "type-check": "tsc --noEmit",
-    "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
-  },
-  "dependencies": {
-    "@datascriba/db-drivers": "workspace:*",
-    "@datascriba/queue-config": "workspace:*",
-    "@datascriba/report-engine": "workspace:*",
-    "@datascriba/shared-types": "workspace:*",
-    "@nestjs/bullmq": "^10.2.3",
-    "@nestjs/common": "^10.4.15",
-    "@nestjs/config": "^3.3.0",
-    "@nestjs/core": "^10.4.15",
-    "@nestjs/platform-express": "^10.4.15",
-    "bullmq": "^5.8.0",
-    "handlebars": "^4.7.8",
-    "ioredis": "^5.4.1",
-    "nodemailer": "^6.9.14",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1",
-    "zod": "^3.24.1"
-  },
-  "devDependencies": {
-    "@datascriba/eslint-config": "workspace:*",
-    "@datascriba/tsconfig": "workspace:*",
-    "@nestjs/cli": "^10.4.9",
-    "@nestjs/testing": "^10.4.15",
-    "@swc/core": "^1.15.33",
-    "@types/nodemailer": "^6.4.17",
-    "@types/node": "^22.10.7",
-    "@typescript-eslint/eslint-plugin": "^7.18.0",
-    "@typescript-eslint/parser": "^7.18.0",
-    "@vitest/coverage-v8": "^2.1.9",
-    "eslint": "^8.57.1",
-    "eslint-config-prettier": "^9.1.0",
-    "eslint-plugin-import": "^2.31.0",
-    "prettier": "^3.3.3",
-    "typescript": "^5.5.4",
-    "unplugin-swc": "^1.5.9",
-    "vitest": "^2.1.9"
+    _store: store,
+    _reset: () => { store.clear(); seq = 0 },
   }
 }
-```
 
-### 4.2 — `apps/worker/tsconfig.json`
+describe('Schedule E2E', () => {
+  let app: INestApplication
+  let repoMock: ReturnType<typeof makeScheduleRepoMock>
+  const queueMock = { add: vi.fn(async () => ({ id: 'job-1' })) }
 
-```json
-{
-  "$schema": "https://json.schemastore.org/tsconfig",
-  "extends": "@datascriba/tsconfig/nestjs.json",
-  "compilerOptions": {
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "baseUrl": ".",
-    "paths": {}
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test", "**/*spec.ts"]
-}
-```
-
-### 4.3 — `apps/worker/tsconfig.build.json`
-
-```json
-{
-  "extends": "./tsconfig.json",
-  "exclude": ["node_modules", "dist", "test", "**/*spec.ts"]
-}
-```
-
-### 4.4 — `apps/worker/nest-cli.json`
-
-```json
-{
-  "$schema": "https://json.schemastore.org/nest-cli",
-  "collection": "@nestjs/schematics",
-  "sourceRoot": "src",
-  "compilerOptions": {
-    "deleteOutDir": true,
-    "tsConfigPath": "tsconfig.build.json"
-  }
-}
-```
-
-### 4.5 — `apps/worker/src/config/worker-env.ts`
-
-```typescript
-import { z } from 'zod'
-
-const workerEnvSchema = z.object({
-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
-  REDIS_HOST: z.string().default('127.0.0.1'),
-  REDIS_PORT: z.coerce.number().int().min(1).max(65535).default(6379),
-  REDIS_PASSWORD: z.string().optional(),
-  /** URL of the API service — worker uses this to fetch report definitions */
-  INTERNAL_API_URL: z.string().url().default('http://localhost:3001'),
-  SMTP_HOST: z.string().optional(),
-  SMTP_PORT: z.coerce.number().int().default(587),
-  SMTP_USER: z.string().optional(),
-  SMTP_PASS: z.string().optional(),
-  SMTP_FROM: z.string().email().optional(),
-  /** Master encryption key — needed to decrypt data-source credentials */
-  ENCRYPTION_MASTER_KEY: z.string().min(64),
-})
-
-export type WorkerEnv = z.infer<typeof workerEnvSchema>
-
-export function validateWorkerEnv(): WorkerEnv {
-  const result = workerEnvSchema.safeParse(process.env)
-  if (!result.success) {
-    const formatted = result.error.issues
-      .map((issue) => `  ${issue.path.join('.')}: ${issue.message}`)
-      .join('\n')
-    process.stderr.write(`Worker environment validation failed:\n${formatted}\n`)
-    process.exit(1)
-  }
-  return result.data
-}
-```
-
-### 4.6 — `apps/worker/src/processors/run-report.processor.ts`
-
-```typescript
-import { Processor, WorkerHost } from '@nestjs/bullmq'
-import { Logger } from '@nestjs/common'
-import type { Job } from 'bullmq'
-import { RunReportJobSchema, QUEUE_NAME, type RunReportJobPayload } from '@datascriba/queue-config'
-
-import { EmailService } from '../services/email.service'
-import { ReportRunnerService } from '../services/report-runner.service'
-
-@Processor(QUEUE_NAME)
-export class RunReportProcessor extends WorkerHost {
-  private readonly logger = new Logger(RunReportProcessor.name)
-
-  constructor(
-    private readonly reportRunner: ReportRunnerService,
-    private readonly emailService: EmailService,
-  ) {
-    super()
+  const validPayload = {
+    reportId: 'rpt-1',
+    cronExpression: '0 9 * * 1',
+    format: 'csv',
+    enabled: true,
   }
 
-  async process(job: Job<unknown>): Promise<void> {
-    // Validate payload at runtime
-    const parseResult = RunReportJobSchema.safeParse(job.data)
-    if (!parseResult.success) {
-      this.logger.error(
-        { jobId: job.id, errors: parseResult.error.issues },
-        'Invalid job payload — job discarded',
-      )
-      throw new Error('Invalid RunReportJob payload')
-    }
+  beforeAll(async () => {
+    repoMock = makeScheduleRepoMock()
 
-    const payload: RunReportJobPayload = parseResult.data
-    this.logger.log(
-      { jobId: job.id, scheduleId: payload.scheduleId, reportId: payload.reportId },
-      'Processing RunReportJob',
-    )
+    const module = await Test.createTestingModule({
+      imports: [ScheduleModule],
+    })
+      .overrideProvider(ScheduleRepository)
+      .useValue(repoMock)
+      .overrideProvider(getQueueToken(QUEUE_NAME))
+      .useValue(queueMock)
+      .compile()
 
-    const { buffer, filename, reportName } = await this.reportRunner.run(payload)
+    app = module.createNestApplication()
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+    await app.init()
+  })
 
-    if (payload.notifyEmail) {
-      await this.emailService.sendReportEmail({
-        to: payload.notifyEmail,
-        reportName,
-        ranAt: new Date(payload.triggeredAt),
-        format: payload.format,
-        attachment: { filename, content: buffer },
-      })
-    }
+  beforeEach(() => {
+    repoMock._reset()
+    vi.clearAllMocks()
+    queueMock.add.mockResolvedValue({ id: 'job-1' })
+  })
 
-    this.logger.log(
-      { jobId: job.id, scheduleId: payload.scheduleId, filename },
-      'RunReportJob completed',
-    )
-  }
-}
-```
+  describe('POST /schedules', () => {
+    it('creates schedule and returns 201', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/schedules')
+        .send(validPayload)
+        .expect(201)
 
-**Not:** `@nestjs/bullmq`'da processor `WorkerHost` abstract sınıfını `extend` eder ve `process()` metodunu override eder. `@nestjs/bull`'daki `@Process()` dekoratörü kullanılmaz.
-
-### 4.7 — `apps/worker/src/services/report-runner.service.ts`
-
-```typescript
-import * as fs from 'node:fs'
-import * as path from 'node:path'
-import { Injectable, Logger } from '@nestjs/common'
-import { ConfigService } from '@nestjs/config'
-import {
-  renderReport,
-  renderTemplate,
-  validateParameters,
-} from '@datascriba/report-engine'
-import type { ExportFormat, ReportDefinition } from '@datascriba/report-engine'
-import type { RunReportJobPayload } from '@datascriba/queue-config'
-import type { WorkerEnv } from '../config/worker-env'
-
-interface RunOutput {
-  buffer: Buffer
-  filename: string
-  reportName: string
-  mimeType: string
-}
-
-const MIME_TYPES: Record<ExportFormat, string> = {
-  csv: 'text/csv; charset=utf-8',
-  excel: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-}
-
-const FILE_EXTENSIONS: Record<ExportFormat, string> = {
-  csv: 'csv',
-  excel: 'xlsx',
-}
-
-const OUTPUT_DIR = path.resolve('./output')
-
-@Injectable()
-export class ReportRunnerService {
-  private readonly logger = new Logger(ReportRunnerService.name)
-
-  constructor(private readonly config: ConfigService<WorkerEnv, true>) {
-    if (!fs.existsSync(OUTPUT_DIR)) {
-      fs.mkdirSync(OUTPUT_DIR, { recursive: true })
-    }
-  }
-
-  /**
-   * Fetches report definition from the API service, executes the query,
-   * renders the output file, and returns the result buffer.
-   *
-   * Strategy: Worker calls INTERNAL_API_URL to get the ReportDefinition.
-   * This avoids duplicating the report store in the worker process.
-   * When Prisma is introduced (future phase), both API and Worker can
-   * share the same DB connection instead.
-   */
-  async run(payload: RunReportJobPayload): Promise<RunOutput> {
-    const apiUrl = this.config.get('INTERNAL_API_URL', { infer: true })
-
-    // 1. Fetch report definition
-    const reportRes = await fetch(`${apiUrl}/reports/${payload.reportId}`)
-    if (!reportRes.ok) {
-      throw new Error(
-        `Failed to fetch report '${payload.reportId}': ${reportRes.status} ${reportRes.statusText}`,
-      )
-    }
-    // The fetch result shape is verified by the API — trust internal call
-    const report = (await reportRes.json()) as ReportDefinition
-
-    // 2. Validate parameters
-    let resolvedParams: Record<string, unknown> = {}
-    if (report.parameters.length > 0) {
-      resolvedParams = validateParameters(report.parameters, payload.parameters)
-    }
-
-    // 3. Render SQL template
-    const sql = renderTemplate(report.query, resolvedParams)
-
-    // 4. Execute query via internal API run endpoint (no direct DB access in worker)
-    // Worker delegates query execution back to the API's /reports/:id/run endpoint.
-    // This keeps MSSQL driver configuration centralized in the API.
-    const runRes = await fetch(`${apiUrl}/reports/${payload.reportId}/run`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/octet-stream' },
-      body: JSON.stringify({ format: payload.format, parameters: payload.parameters }),
+      expect(res.body.cronExpression).toBe('0 9 * * 1')
+      expect(res.body.id).toBeDefined()
     })
 
-    if (!runRes.ok) {
-      const errText = await runRes.text()
-      throw new Error(`Report run failed: ${runRes.status} — ${errText}`)
-    }
+    it('returns 400 for invalid cron expression', async () => {
+      await request(app.getHttpServer())
+        .post('/schedules')
+        .send({ ...validPayload, cronExpression: 'not-a-cron' })
+        .expect(400)
+    })
 
-    const arrayBuffer = await runRes.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
+    it('returns 400 when reportId is missing', async () => {
+      await request(app.getHttpServer())
+        .post('/schedules')
+        .send({ cronExpression: '0 9 * * 1', format: 'csv' })
+        .expect(400)
+    })
+  })
 
-    const ext = FILE_EXTENSIONS[payload.format]
-    const safeName = report.name.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 64)
-    const runId = crypto.randomUUID()
-    const filename = `${safeName}-${runId}.${ext}`
-    const outputPath = path.join(OUTPUT_DIR, filename)
+  describe('GET /schedules', () => {
+    it('returns empty array initially', async () => {
+      const res = await request(app.getHttpServer()).get('/schedules').expect(200)
+      expect(res.body).toHaveLength(0)
+    })
 
-    if (!outputPath.startsWith(OUTPUT_DIR + path.sep)) {
-      throw new Error('Invalid output path detected')
-    }
+    it('returns created schedules', async () => {
+      await request(app.getHttpServer()).post('/schedules').send(validPayload)
+      const res = await request(app.getHttpServer()).get('/schedules').expect(200)
+      expect(res.body).toHaveLength(1)
+    })
+  })
 
-    fs.writeFileSync(outputPath, buffer)
+  describe('GET /schedules/:id', () => {
+    it('returns 404 for unknown id', async () => {
+      await request(app.getHttpServer()).get('/schedules/ghost').expect(404)
+    })
+  })
 
-    this.logger.log({ reportId: payload.reportId, filename }, 'Report file written by worker')
+  describe('PATCH /schedules/:id', () => {
+    it('updates enabled flag', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/schedules')
+        .send(validPayload)
 
-    return {
-      buffer,
-      filename,
-      reportName: report.name,
-      mimeType: MIME_TYPES[payload.format],
-    }
+      const res = await request(app.getHttpServer())
+        .patch(`/schedules/${created.body.id}`)
+        .send({ enabled: false })
+        .expect(200)
+
+      expect(res.body.enabled).toBe(false)
+    })
+
+    it('returns 400 for invalid cron on update', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/schedules')
+        .send(validPayload)
+
+      await request(app.getHttpServer())
+        .patch(`/schedules/${created.body.id}`)
+        .send({ cronExpression: 'bad-cron' })
+        .expect(400)
+    })
+  })
+
+  describe('DELETE /schedules/:id', () => {
+    it('deletes schedule and returns 204', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/schedules')
+        .send(validPayload)
+
+      await request(app.getHttpServer())
+        .delete(`/schedules/${created.body.id}`)
+        .expect(204)
+    })
+  })
+
+  describe('POST /schedules/:id/trigger', () => {
+    it('triggers schedule and returns jobId', async () => {
+      const created = await request(app.getHttpServer())
+        .post('/schedules')
+        .send(validPayload)
+
+      const res = await request(app.getHttpServer())
+        .post(`/schedules/${created.body.id}/trigger`)
+        .expect(200)
+
+      expect(res.body.jobId).toBe('job-1')
+      expect(queueMock.add).toHaveBeenCalledOnce()
+    })
+
+    it('returns 404 when triggering non-existent schedule', async () => {
+      await request(app.getHttpServer())
+        .post('/schedules/ghost/trigger')
+        .expect(404)
+    })
+  })
+})
+```
+
+---
+
+## STEP 4 — Backend Integration Tests: AI E2E
+
+**Dosya:** `apps/api/src/modules/ai/ai.e2e-spec.ts`
+
+**Strateji:**
+- `AiService` methodlarını doğrudan mock'la (gerçek Anthropic çağrısı yok).
+- SSE endpoint'leri için `request(app.getHttpServer()).post(...).buffer(true)` kullan.
+- `ThrottlerGuard`'ı devre dışı bırak: `overrideGuard(ThrottlerGuard).useValue({ canActivate: () => true })`.
+
+**İçerik:**
+
+```typescript
+// apps/api/src/modules/ai/ai.e2e-spec.ts
+import { INestApplication, ValidationPipe } from '@nestjs/common'
+import { Test } from '@nestjs/testing'
+import { ThrottlerGuard } from '@nestjs/throttler'
+import request from 'supertest'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { AiModule } from './ai.module'
+import { AiService } from './ai.service'
+
+async function* fakeStream(text: string): AsyncIterable<{
+  type: 'delta' | 'done' | 'error'
+  text?: string
+  error?: string
+}> {
+  yield { type: 'delta', text }
+  yield { type: 'done' }
+}
+
+function makeAiServiceMock() {
+  return {
+    onModuleInit: vi.fn(),
+    suggestQuery: vi.fn(() => fakeStream('SELECT 1')),
+    explainQuery: vi.fn(async () => ({
+      turkish: 'Turkce aciklama.',
+      english: 'English explanation.',
+      model: 'claude-sonnet-4-6',
+    })),
+    fixQuery: vi.fn(() => fakeStream('SELECT * FROM fixed')),
   }
 }
-```
 
-### 4.8 — `apps/worker/src/services/email.service.ts`
+describe('AI E2E', () => {
+  let app: INestApplication
+  let aiServiceMock: ReturnType<typeof makeAiServiceMock>
 
-Worker'ın email service'i, API'deki ile aynı mantıgı kullanır. `WorkerEnv` tipini kullanması disinda STEP 3.8 ile özdes içeriktedir:
+  beforeAll(async () => {
+    process.env['ANTHROPIC_API_KEY'] = 'test-key'
+    process.env['AI_MODEL'] = 'claude-sonnet-4-6'
+    process.env['ENCRYPTION_MASTER_KEY'] = 'a'.repeat(64)
 
-```typescript
-import { Injectable, Logger } from '@nestjs/common'
-import { ConfigService } from '@nestjs/config'
-import * as nodemailer from 'nodemailer'
-import Handlebars from 'handlebars'
-import type { WorkerEnv } from '../config/worker-env'
+    aiServiceMock = makeAiServiceMock()
 
-// EMAIL_TEMPLATE_SOURCE ve ReportEmailOptions STEP 3.8 ile özdes —
-// builder STEP 3.8'deki içerigi kopyalar, sadece import satirini degistirir:
-// ConfigService<WorkerEnv, true> kullanilir.
-```
+    const module = await Test.createTestingModule({
+      imports: [AiModule],
+    })
+      .overrideProvider(AiService)
+      .useValue(aiServiceMock)
+      .overrideGuard(ThrottlerGuard)
+      .useValue({ canActivate: () => true })
+      .compile()
 
-Dosyanin tam içerigi STEP 3.8 ile aynıdir — builder kod tekrarine ragmen kopyalamalıdır çünkü worker ayri bir NestJS uygulamasıdır.
-
-### 4.9 — `apps/worker/src/worker.module.ts`
-
-```typescript
-import { BullMQModule } from '@nestjs/bullmq'
-import { Module } from '@nestjs/common'
-import { ConfigModule, ConfigService } from '@nestjs/config'
-import { createWorkerOptions, QUEUE_NAME } from '@datascriba/queue-config'
-import type { WorkerEnv } from './config/worker-env'
-
-import { EmailService } from './services/email.service'
-import { ReportRunnerService } from './services/report-runner.service'
-import { RunReportProcessor } from './processors/run-report.processor'
-
-@Module({
-  imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-      envFilePath: ['.env.local', '.env'],
-    }),
-    BullMQModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService<WorkerEnv, true>) =>
-        createWorkerOptions({
-          host: config.get('REDIS_HOST'),
-          port: config.get('REDIS_PORT'),
-          password: config.get('REDIS_PASSWORD'),
-        }),
-    }),
-    BullMQModule.registerQueue({ name: QUEUE_NAME }),
-  ],
-  providers: [RunReportProcessor, ReportRunnerService, EmailService],
-})
-export class WorkerModule {}
-```
-
-### 4.10 — `apps/worker/src/main.ts`
-
-```typescript
-import { NestFactory } from '@nestjs/core'
-import { Logger } from '@nestjs/common'
-import { validateWorkerEnv } from './config/worker-env'
-import { WorkerModule } from './worker.module'
-
-async function bootstrap(): Promise<void> {
-  validateWorkerEnv()
-  const logger = new Logger('Worker')
-
-  const app = await NestFactory.createApplicationContext(WorkerModule, {
-    logger: ['error', 'warn', 'log'],
+    app = module.createNestApplication()
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))
+    await app.init()
   })
 
-  app.enableShutdownHooks()
+  describe('POST /ai/suggest-query (SSE)', () => {
+    it('returns 200 with text/event-stream content-type', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/ai/suggest-query')
+        .send({ prompt: 'Show all users', dataSourceId: 'ds-1' })
+        .buffer(true)
+        .parse((res, callback) => {
+          let data = ''
+          res.on('data', (chunk: Buffer) => { data += chunk.toString() })
+          res.on('end', () => callback(null, data))
+        })
 
-  logger.log('DataScriba Worker started — listening for report jobs')
-}
+      expect(res.status).toBe(200)
+      expect(res.headers['content-type']).toMatch(/text\/event-stream/)
+      expect(res.body as string).toContain('SELECT 1')
+    })
 
-void bootstrap()
+    it('returns 400 when prompt is missing', async () => {
+      await request(app.getHttpServer())
+        .post('/ai/suggest-query')
+        .send({ dataSourceId: 'ds-1' })
+        .expect(400)
+    })
+  })
+
+  describe('POST /ai/explain-query', () => {
+    it('returns explanation in turkish and english', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/ai/explain-query')
+        .send({ sql: 'SELECT * FROM users' })
+        .expect(200)
+
+      expect(res.body.turkish).toBe('Turkce aciklama.')
+      expect(res.body.english).toBe('English explanation.')
+      expect(res.body.model).toBe('claude-sonnet-4-6')
+    })
+
+    it('returns 400 when sql is missing', async () => {
+      await request(app.getHttpServer())
+        .post('/ai/explain-query')
+        .send({})
+        .expect(400)
+    })
+  })
+
+  describe('POST /ai/fix-query (SSE)', () => {
+    it('returns 200 with streaming response containing fixed SQL', async () => {
+      const res = await request(app.getHttpServer())
+        .post('/ai/fix-query')
+        .send({ sql: 'SELEC * FROM users', errorMessage: 'syntax error' })
+        .buffer(true)
+        .parse((res, callback) => {
+          let data = ''
+          res.on('data', (chunk: Buffer) => { data += chunk.toString() })
+          res.on('end', () => callback(null, data))
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body as string).toContain('fixed')
+    })
+  })
+})
 ```
 
 ---
 
-## STEP 5 — Frontend: Schedule UI
+## STEP 5 — Frontend: use-ai.test.ts
 
-**Amaç:** `/schedules` sayfası, schedule CRUD dialog'u ve rapor sayfasına "Zamanla" butonu eklemek.
-**Bagımlılıklar:** STEP 2, STEP 3 (API endpoint'leri çalısır durumda olmali)
+**Dosya:** `apps/web/src/hooks/use-ai.test.ts`
 
-### 5.1 — `apps/web/src/hooks/use-schedules.ts`
+**Strateji:**
+- `vitest` + `@testing-library/react` ile hook'ları test et.
+- `global.fetch` mock'la: `vi.stubGlobal('fetch', vi.fn())`.
+- SSE stream simüle etmek için `ReadableStream` + `TextEncoder` kullan.
+
+**Ön koşul — Web vitest config kontrolü:**
+`apps/web` dizininde `vitest.config.ts` yoksa oluştur:
 
 ```typescript
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { ScheduleDefinition, CreateScheduleRequest, UpdateScheduleRequest } from '@datascriba/shared-types'
-import { apiClient } from '@/lib/api-client'
+// apps/web/vitest.config.ts
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+import path from 'node:path'
 
-const QUERY_KEY = ['schedules'] as const
-
-export function useSchedules() {
-  return useQuery({
-    queryKey: QUERY_KEY,
-    queryFn: () => apiClient.get<ScheduleDefinition[]>('/schedules'),
-  })
-}
-
-export function useSchedule(id: string) {
-  return useQuery({
-    queryKey: [...QUERY_KEY, id],
-    queryFn: () => apiClient.get<ScheduleDefinition>(`/schedules/${id}`),
-    enabled: Boolean(id),
-  })
-}
-
-export function useCreateSchedule() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: CreateScheduleRequest) =>
-      apiClient.post<ScheduleDefinition>('/schedules', payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useUpdateSchedule(id: string) {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (payload: UpdateScheduleRequest) =>
-      apiClient.put<ScheduleDefinition>(`/schedules/${id}`, payload),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useDeleteSchedule() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => apiClient.delete<void>(`/schedules/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useTriggerSchedule() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: (id: string) => apiClient.post<{ jobId: string }>(`/schedules/${id}/trigger`, {}),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
-
-export function useToggleSchedule() {
-  const qc = useQueryClient()
-  return useMutation({
-    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
-      apiClient.put<ScheduleDefinition>(`/schedules/${id}`, { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: QUERY_KEY }),
-  })
-}
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./src/test-setup.ts'],
+    include: ['src/**/*.test.{ts,tsx}'],
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
+})
 ```
 
-### 5.2 — `apps/web/src/i18n/messages/en.json` (GUNCELLE)
+**Ön koşul — apps/web/src/test-setup.ts yoksa oluştur:**
 
-Mevcut JSON'a `"schedule"` anahtarını ekle. Diger anahtarlara dokunma:
+```typescript
+// apps/web/src/test-setup.ts
+import '@testing-library/jest-dom'
+```
 
+**Ön koşul — apps/web/package.json'a script ekle:**
 ```json
-"schedule": {
-  "title": "Schedules",
-  "createNew": "New Schedule",
-  "editTitle": "Edit Schedule",
-  "report": "Report",
-  "cronExpression": "Cron Expression",
-  "cronPreview": "Next run",
-  "format": "Export Format",
-  "notifyEmail": "Notification Email",
-  "notifyEmailPlaceholder": "reports@company.com",
-  "enabled": "Enabled",
-  "lastRunAt": "Last Run",
-  "nextRunAt": "Next Run",
-  "trigger": "Run Now",
-  "triggered": "Job enqueued",
-  "deleteConfirm": "Are you sure you want to delete this schedule?",
-  "noSchedules": "No schedules yet. Create one to automate your reports.",
-  "scheduleReport": "Schedule",
-  "invalidCron": "Invalid cron expression"
-}
+"test": "vitest run",
+"test:watch": "vitest",
+"test:coverage": "vitest run --coverage"
 ```
 
-### 5.3 — `apps/web/src/i18n/messages/tr.json` (GUNCELLE)
-
-Mevcut Türkçe JSON'a `"schedule"` anahtarını ekle:
-
-```json
-"schedule": {
-  "title": "Zamanlamalar",
-  "createNew": "Yeni Zamanlama",
-  "editTitle": "Zamanlama Duzenle",
-  "report": "Rapor",
-  "cronExpression": "Cron Ifadesi",
-  "cronPreview": "Sonraki calisma",
-  "format": "Disa Aktarma Formati",
-  "notifyEmail": "Bildirim E-postasi",
-  "notifyEmailPlaceholder": "raporlar@sirket.com",
-  "enabled": "Aktif",
-  "lastRunAt": "Son Calisma",
-  "nextRunAt": "Sonraki Calisma",
-  "trigger": "Simdi Calistir",
-  "triggered": "Is kuyruga eklendi",
-  "deleteConfirm": "Bu zamanlama silinsin mi?",
-  "noSchedules": "Henuz zamanlama yok. Raporlarınızı otomatlastirmak icin bir tane olusturun.",
-  "scheduleReport": "Zamanla",
-  "invalidCron": "Gecersiz cron ifadesi"
-}
-```
-
-### 5.4 — `apps/web/src/app/[locale]/schedules/page.tsx`
+**Ana test dosyası:**
 
 ```typescript
-import { useTranslations } from 'next-intl'
-import { SchedulesClient } from './schedules-client'
+// apps/web/src/hooks/use-ai.test.ts
+import { renderHook, act, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-export default function SchedulesPage() {
-  const t = useTranslations('schedule')
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold">{t('title')}</h1>
-      <SchedulesClient />
-    </div>
-  )
+vi.mock('@/lib/env', () => ({
+  env: { NEXT_PUBLIC_API_URL: 'http://localhost:3001' },
+}))
+
+import { useSuggestQuery, useExplainQuery, useFixQuery } from './use-ai'
+
+function makeSseStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk))
+      }
+      controller.close()
+    },
+  })
 }
-```
 
-### 5.5 — `apps/web/src/app/[locale]/schedules/schedules-client.tsx`
-
-```typescript
-'use client'
-
-import { useState } from 'react'
-import { useTranslations } from 'next-intl'
-import { Play, Plus, Trash2 } from 'lucide-react'
-import { format } from 'date-fns'
-import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
-import {
-  useSchedules,
-  useDeleteSchedule,
-  useTriggerSchedule,
-  useToggleSchedule,
-} from '@/hooks/use-schedules'
-import { CreateScheduleDialog } from './create-schedule-dialog'
-
-export function SchedulesClient() {
-  const t = useTranslations('schedule')
-  const tc = useTranslations('common')
-  const [createOpen, setCreateOpen] = useState(false)
-
-  const { data: schedules, isLoading } = useSchedules()
-  const deleteMutation = useDeleteSchedule()
-  const triggerMutation = useTriggerSchedule()
-  const toggleMutation = useToggleSchedule()
-
-  if (isLoading) return <p className="text-muted-foreground">{tc('loading')}</p>
-
-  return (
-    <>
-      <div className="flex items-center justify-between">
-        <p className="text-sm text-muted-foreground">
-          {schedules?.length ?? 0} schedule(s)
-        </p>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="mr-2 h-4 w-4" />
-          {t('createNew')}
-        </Button>
-      </div>
-
-      {schedules?.length === 0 && (
-        <p className="text-center text-muted-foreground py-12">{t('noSchedules')}</p>
-      )}
-
-      {schedules && schedules.length > 0 && (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>{t('report')}</TableHead>
-              <TableHead>{t('cronExpression')}</TableHead>
-              <TableHead>{t('format')}</TableHead>
-              <TableHead>{t('nextRunAt')}</TableHead>
-              <TableHead>{t('lastRunAt')}</TableHead>
-              <TableHead>{t('enabled')}</TableHead>
-              <TableHead>{tc('actions')}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {schedules.map((schedule) => (
-              <TableRow key={schedule.id}>
-                <TableCell className="font-mono text-xs">{schedule.reportId}</TableCell>
-                <TableCell className="font-mono text-xs">{schedule.cronExpression}</TableCell>
-                <TableCell className="uppercase text-xs">{schedule.format}</TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  {schedule.nextRunAt
-                    ? format(new Date(schedule.nextRunAt), 'yyyy-MM-dd HH:mm')
-                    : '—'}
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  {schedule.lastRunAt
-                    ? format(new Date(schedule.lastRunAt), 'yyyy-MM-dd HH:mm')
-                    : '—'}
-                </TableCell>
-                <TableCell>
-                  <Switch
-                    checked={schedule.enabled}
-                    onCheckedChange={(enabled) =>
-                      toggleMutation.mutate({ id: schedule.id, enabled })
-                    }
-                  />
-                </TableCell>
-                <TableCell>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => triggerMutation.mutate(schedule.id)}
-                      title={t('trigger')}
-                    >
-                      <Play className="h-4 w-4" />
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => {
-                        if (window.confirm(t('deleteConfirm'))) {
-                          deleteMutation.mutate(schedule.id)
-                        }
-                      }}
-                      title={tc('delete')}
-                    >
-                      <Trash2 className="h-4 w-4 text-destructive" />
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      )}
-
-      <CreateScheduleDialog open={createOpen} onOpenChange={setCreateOpen} />
-    </>
-  )
+function makeJsonChunk(payload: Record<string, unknown>): string {
+  return `data: ${JSON.stringify(payload)}\n\n`
 }
-```
 
-### 5.6 — `apps/web/src/app/[locale]/schedules/create-schedule-dialog.tsx`
+describe('useSuggestQuery', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
 
-```typescript
-'use client'
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
 
-import { useCallback, useEffect } from 'react'
-import { useForm } from 'react-hook-form'
-import { zodResolver } from '@hookform/resolvers/zod'
-import { z } from 'zod'
-import { useTranslations } from 'next-intl'
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
-import { useCreateSchedule } from '@/hooks/use-schedules'
-import { useReports } from '@/hooks/use-reports'
+  it('starts with empty text and not streaming', () => {
+    const { result } = renderHook(() => useSuggestQuery())
+    expect(result.current.state.text).toBe('')
+    expect(result.current.state.isStreaming).toBe(false)
+    expect(result.current.state.error).toBeNull()
+  })
 
-const createScheduleSchema = z.object({
-  reportId: z.string().min(1, 'Select a report'),
-  cronExpression: z.string().min(9, 'Enter a valid cron expression'),
-  format: z.enum(['csv', 'excel']),
-  notifyEmail: z.string().email().optional().or(z.literal('')),
+  it('accumulates delta chunks and marks done', async () => {
+    const stream = makeSseStream([
+      makeJsonChunk({ type: 'delta', text: 'SELECT ' }),
+      makeJsonChunk({ type: 'delta', text: '1' }),
+      makeJsonChunk({ type: 'done' }),
+    ])
+
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(stream, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      }),
+    )
+
+    const { result } = renderHook(() => useSuggestQuery())
+
+    act(() => {
+      void result.current.suggest({ prompt: 'Show users', dataSourceId: 'ds-1' })
+    })
+
+    await waitFor(() => expect(result.current.state.isStreaming).toBe(false))
+
+    expect(result.current.state.text).toBe('SELECT 1')
+    expect(result.current.state.error).toBeNull()
+  })
+
+  it('sets error when fetch throws', async () => {
+    vi.mocked(fetch).mockRejectedValueOnce(new Error('Network failure'))
+
+    const { result } = renderHook(() => useSuggestQuery())
+
+    await act(async () => {
+      await result.current.suggest({ prompt: 'test', dataSourceId: 'ds-1' })
+    })
+
+    expect(result.current.state.error).toMatch(/network/i)
+    expect(result.current.state.isStreaming).toBe(false)
+  })
+
+  it('sets error on non-200 response', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response('Unauthorized', { status: 401 }),
+    )
+
+    const { result } = renderHook(() => useSuggestQuery())
+
+    await act(async () => {
+      await result.current.suggest({ prompt: 'test', dataSourceId: 'ds-1' })
+    })
+
+    expect(result.current.state.error).toMatch(/401/)
+  })
+
+  it('reset clears accumulated text and error', async () => {
+    const stream = makeSseStream([
+      makeJsonChunk({ type: 'delta', text: 'SQL' }),
+      makeJsonChunk({ type: 'done' }),
+    ])
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(stream, { status: 200 }))
+
+    const { result } = renderHook(() => useSuggestQuery())
+
+    await act(async () => {
+      await result.current.suggest({ prompt: 'test', dataSourceId: 'ds-1' })
+    })
+
+    act(() => { result.current.reset() })
+
+    expect(result.current.state.text).toBe('')
+    expect(result.current.state.error).toBeNull()
+  })
 })
 
-type CreateScheduleForm = z.infer<typeof createScheduleSchema>
-
-interface CreateScheduleDialogProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  initialReportId?: string
-}
-
-export function CreateScheduleDialog({
-  open,
-  onOpenChange,
-  initialReportId,
-}: CreateScheduleDialogProps) {
-  const t = useTranslations('schedule')
-  const tc = useTranslations('common')
-  const { data: reports } = useReports()
-  const createMutation = useCreateSchedule()
-
-  const {
-    register,
-    handleSubmit,
-    setValue,
-    reset,
-    formState: { errors, isSubmitting },
-  } = useForm<CreateScheduleForm>({
-    resolver: zodResolver(createScheduleSchema),
-    defaultValues: {
-      reportId: initialReportId ?? '',
-      cronExpression: '0 8 * * 1-5',
-      format: 'excel',
-    },
+describe('useExplainQuery', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
   })
 
-  useEffect(() => {
-    if (initialReportId) setValue('reportId', initialReportId)
-  }, [initialReportId, setValue])
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
 
-  const onSubmit = useCallback(
-    async (data: CreateScheduleForm) => {
-      await createMutation.mutateAsync({
-        reportId: data.reportId,
-        cronExpression: data.cronExpression,
-        format: data.format,
-        notifyEmail: data.notifyEmail || undefined,
-        enabled: true,
-      })
-      reset()
-      onOpenChange(false)
-    },
-    [createMutation, reset, onOpenChange],
-  )
+  it('starts with null response and not loading', () => {
+    const { result } = renderHook(() => useExplainQuery())
+    expect(result.current.response).toBeNull()
+    expect(result.current.isLoading).toBe(false)
+  })
 
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[480px]">
-        <DialogHeader>
-          <DialogTitle>{t('createNew')}</DialogTitle>
-        </DialogHeader>
+  it('fetches explanation and sets response', async () => {
+    const payload = { turkish: 'Turkce', english: 'English', model: 'claude-sonnet-4-6' }
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
 
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-          {/* Report selector */}
-          <div className="space-y-1">
-            <Label htmlFor="reportId">{t('report')}</Label>
-            <Select
-              onValueChange={(val) => setValue('reportId', val)}
-              defaultValue={initialReportId}
-            >
-              <SelectTrigger id="reportId">
-                <SelectValue placeholder="Select a report" />
-              </SelectTrigger>
-              <SelectContent>
-                {reports?.map((r) => (
-                  <SelectItem key={r.id} value={r.id}>
-                    {r.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {errors.reportId && (
-              <p className="text-xs text-destructive">{errors.reportId.message}</p>
-            )}
-          </div>
+    const { result } = renderHook(() => useExplainQuery())
 
-          {/* Cron expression */}
-          <div className="space-y-1">
-            <Label htmlFor="cronExpression">{t('cronExpression')}</Label>
-            <Input
-              id="cronExpression"
-              {...register('cronExpression')}
-              placeholder="0 8 * * 1-5"
-              className="font-mono text-sm"
-            />
-            {errors.cronExpression && (
-              <p className="text-xs text-destructive">{errors.cronExpression.message}</p>
-            )}
-            <p className="text-xs text-muted-foreground">
-              e.g. <code>0 8 * * 1-5</code> = weekdays at 08:00
-            </p>
-          </div>
+    await act(async () => {
+      await result.current.explain({ sql: 'SELECT 1' })
+    })
 
-          {/* Format */}
-          <div className="space-y-1">
-            <Label htmlFor="format">{t('format')}</Label>
-            <Select
-              onValueChange={(val) => setValue('format', val as 'csv' | 'excel')}
-              defaultValue="excel"
-            >
-              <SelectTrigger id="format">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="csv">CSV</SelectItem>
-                <SelectItem value="excel">Excel (.xlsx)</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+    expect(result.current.response?.turkish).toBe('Turkce')
+    expect(result.current.response?.english).toBe('English')
+    expect(result.current.isLoading).toBe(false)
+  })
 
-          {/* Notify email */}
-          <div className="space-y-1">
-            <Label htmlFor="notifyEmail">{t('notifyEmail')}</Label>
-            <Input
-              id="notifyEmail"
-              {...register('notifyEmail')}
-              placeholder={t('notifyEmailPlaceholder')}
-              type="email"
-            />
-            {errors.notifyEmail && (
-              <p className="text-xs text-destructive">{errors.notifyEmail.message}</p>
-            )}
-          </div>
+  it('sets error on API failure', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response('Server Error', { status: 500 }),
+    )
 
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {tc('cancel')}
-            </Button>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? tc('loading') : tc('create')}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  )
-}
-```
+    const { result } = renderHook(() => useExplainQuery())
 
-### 5.7 — Sidebar Guncellemesi: `apps/web/src/components/layout/sidebar.tsx` (GUNCELLE)
+    await act(async () => {
+      await result.current.explain({ sql: 'SELECT 1' })
+    })
 
-`navItems` dizisine `schedules` girisini ekle ve `Calendar` ikonunu import et:
+    expect(result.current.error).toMatch(/500/)
+    expect(result.current.response).toBeNull()
+  })
+})
 
-```typescript
-import { Calendar, Database, FileText, Settings } from 'lucide-react'
+describe('useFixQuery', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
 
-const navItems = [
-  { href: '/data-sources', icon: Database, labelKey: 'dataSources' },
-  { href: '/reports', icon: FileText, labelKey: 'reports' },
-  { href: '/schedules', icon: Calendar, labelKey: 'schedules' },
-  { href: '/settings', icon: Settings, labelKey: 'settings' },
-] as const
-```
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
 
-`en.json` ve `tr.json` dosyalarının `nav` namespace'ine de ekle:
-- `en.json`: `"schedules": "Schedules"`
-- `tr.json`: `"schedules": "Zamanlamalar"`
+  it('streams fixed SQL and sets text', async () => {
+    const stream = makeSseStream([
+      makeJsonChunk({ type: 'delta', text: 'SELECT * FROM users' }),
+      makeJsonChunk({ type: 'done' }),
+    ])
 
-### 5.8 — Rapor Detay Sayfasına "Zamanla" Butonu
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    )
 
-`apps/web/src/app/[locale]/reports/[id]/` altındaki rapor detay istemci bilesenine su eklemeleri yap:
+    const { result } = renderHook(() => useFixQuery())
 
-Builder önce mevcut dosyayı okur (`reports/[id]/page.tsx` veya ilgili client bileşeni). Ardından:
+    await act(async () => {
+      await result.current.fix({ sql: 'SELEC * FROM users', errorMessage: 'syntax error' })
+    })
 
-```typescript
-// Eklenecek import'lar:
-import { useState } from 'react'
-import { Clock } from 'lucide-react'
-import { CreateScheduleDialog } from '../../schedules/create-schedule-dialog'
-
-// Bileşen içine state ekle:
-const [scheduleOpen, setScheduleOpen] = useState(false)
-
-// Mevcut "Run Report" butonunun yanına ekle:
-<Button variant="outline" size="sm" onClick={() => setScheduleOpen(true)}>
-  <Clock className="mr-2 h-4 w-4" />
-  {t('scheduleReport')}
-</Button>
-
-// JSX'in sonuna ekle (return'den önce değil, return içinde):
-<CreateScheduleDialog
-  open={scheduleOpen}
-  onOpenChange={setScheduleOpen}
-  initialReportId={report.id}
-/>
+    expect(result.current.state.text).toBe('SELECT * FROM users')
+    expect(result.current.state.isStreaming).toBe(false)
+  })
+})
 ```
 
 ---
 
-## STEP 6 — DevOps: Docker Compose & Dockerfile
+## STEP 6 — Frontend: AiAssistantPanel Component Test
 
-**Amaç:** Tüm servisleri containerize etmek; production ve development için ayri compose dosyaları saglamak.
-**Bagımlılıklar:** STEP 4 (worker uygulamasi mevcut olmali)
+**Dosya:** `apps/web/src/components/ai/ai-assistant-panel.test.tsx`
 
-### 6.1 — `docker/docker-compose.yml` (TAM YENIDEN YAZ)
+**Strateji:**
+- `@testing-library/react` render et.
+- `use-ai` hook'larını `vi.mock('@/hooks/use-ai', ...)` ile mock'la.
+- `next-intl`'i mock'la: `useTranslations` her key'i kendisi döndürsün.
+- Temel render, panel açma, buton durumları, callback çağrısı test et.
+
+**İçerik:**
+
+```typescript
+// apps/web/src/components/ai/ai-assistant-panel.test.tsx
+import { render, screen, fireEvent } from '@testing-library/react'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+
+vi.mock('next-intl', () => ({
+  useTranslations: () => (key: string) => key,
+}))
+
+const mockSuggest = vi.fn()
+const mockExplain = vi.fn()
+const mockFix = vi.fn()
+const mockReset = vi.fn()
+
+vi.mock('@/hooks/use-ai', () => ({
+  useSuggestQuery: () => ({
+    suggest: mockSuggest,
+    state: { text: '', isStreaming: false, error: null },
+    reset: mockReset,
+  }),
+  useExplainQuery: () => ({
+    explain: mockExplain,
+    response: null,
+    isLoading: false,
+    error: null,
+    reset: mockReset,
+  }),
+  useFixQuery: () => ({
+    fix: mockFix,
+    state: { text: '', isStreaming: false, error: null },
+    reset: mockReset,
+  }),
+}))
+
+import { AiAssistantPanel } from './ai-assistant-panel'
+
+const defaultProps = {
+  dataSourceId: 'ds-1',
+  currentSql: 'SELECT * FROM users',
+  onApplySql: vi.fn(),
+}
+
+describe('AiAssistantPanel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('renders the collapsed toggle trigger button', () => {
+    render(<AiAssistantPanel {...defaultProps} />)
+    const trigger = screen.getByRole('button', { name: /openPanel/i })
+    expect(trigger).toBeDefined()
+  })
+
+  it('opens panel on trigger click and shows panel title', () => {
+    render(<AiAssistantPanel {...defaultProps} />)
+    const trigger = screen.getByRole('button', { name: /openPanel/i })
+    fireEvent.click(trigger)
+    expect(screen.getByText('panelTitle')).toBeDefined()
+  })
+
+  it('shows no-data-source warning when dataSourceId is empty', () => {
+    render(<AiAssistantPanel {...defaultProps} dataSourceId="" />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+    expect(screen.getByText('noDataSourceWarning')).toBeDefined()
+  })
+
+  it('suggest button is disabled when prompt textarea is empty', () => {
+    render(<AiAssistantPanel {...defaultProps} />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+
+    const suggestBtn = screen.getByText('suggestButton').closest('button')
+    expect(suggestBtn?.disabled).toBe(true)
+  })
+
+  it('calls suggest with prompt and dataSourceId when button clicked', () => {
+    render(<AiAssistantPanel {...defaultProps} />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+
+    const textareas = screen.getAllByRole('textbox')
+    const promptTextarea = textareas[0]
+    if (promptTextarea) {
+      fireEvent.change(promptTextarea, { target: { value: 'Show all orders' } })
+    }
+
+    const suggestBtn = screen.getByText('suggestButton').closest('button')
+    if (suggestBtn) fireEvent.click(suggestBtn)
+
+    expect(mockSuggest).toHaveBeenCalledWith({
+      prompt: 'Show all orders',
+      dataSourceId: 'ds-1',
+    })
+  })
+
+  it('calls explain with currentSql when explain button clicked', () => {
+    render(<AiAssistantPanel {...defaultProps} />)
+    const trigger = screen.getByRole('button')
+    fireEvent.click(trigger)
+
+    const explainBtn = screen.getByText('explainButton').closest('button')
+    if (explainBtn) fireEvent.click(explainBtn)
+
+    expect(mockExplain).toHaveBeenCalledWith({ sql: 'SELECT * FROM users' })
+  })
+})
+```
+
+---
+
+## STEP 7 — README.md (Tam Yenileme)
+
+**Dosya:** `README.md` — proje kök dizini. Mevcut içeriği TAMAMEN değiştir.
+
+**İçerik:**
+
+```markdown
+# DataScriba
+
+> Your AI-powered data scribe
+
+DataScriba is a modern, open-source reporting platform with AI-assisted SQL generation,
+scheduling, and multi-format export. Inspired by NextReports, built from scratch in TypeScript.
+
+## Features
+
+- **Data Source Management** — Connect to MSSQL databases with encrypted credentials (AES-256-GCM)
+- **Report Builder** — SQL-based report definitions with typed parameters (string, number, date, dateRange, select, multiSelect, boolean)
+- **Export Formats** — CSV and Excel (.xlsx) with styled headers and frozen panes
+- **Scheduler** — Cron-based report scheduling with BullMQ queue dispatch
+- **Scriba AI** — Natural language to SQL, query explanation (TR/EN), and query fixing via Anthropic Claude (streaming SSE)
+- **REST API** — NestJS 10 API with Swagger UI at `/api/docs`
+- **Worker** — Separate BullMQ worker process for async report execution
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Backend | NestJS 10, TypeScript 5.5+ |
+| Queue | BullMQ + Redis 7 |
+| Database | PostgreSQL 16 (Prisma) |
+| AI | Anthropic Claude (claude-sonnet-4-6) |
+| Frontend | Next.js 15, React 19, TailwindCSS 4 |
+| Export | ExcelJS, PapaParse |
+
+## Quickstart
+
+### Prerequisites
+
+- Docker and Docker Compose v2
+- Node.js 22 LTS
+- pnpm 9+
+
+### 1. Clone and Install
+
+```bash
+git clone https://github.com/your-org/datascriba.git
+cd datascriba
+pnpm install
+```
+
+### 2. Configure Environment
+
+```bash
+cp .env.example .env
+# Edit .env — at minimum set ENCRYPTION_MASTER_KEY and ANTHROPIC_API_KEY
+# Generate ENCRYPTION_MASTER_KEY: openssl rand -hex 32
+```
+
+### 3. Start Infrastructure
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+Starts PostgreSQL 16, Redis 7, API (port 3001), and Worker.
+
+### 4. Open
+
+| Service | URL |
+|---------|-----|
+| Web App | http://localhost:3000 |
+| API Swagger | http://localhost:3001/api/docs |
+| Health | http://localhost:3001/health |
+
+### Local Development (without Docker API/Worker)
+
+```bash
+# Infrastructure only
+docker compose -f docker/docker-compose.yml up postgres redis -d
+
+# In separate terminals:
+pnpm --filter=api dev
+pnpm --filter=worker dev
+pnpm --filter=web dev
+```
+
+## Screenshots
+
+<!-- Screenshots will be added after UI stabilization -->
+_Coming soon._
+
+## Development Commands
+
+```bash
+pnpm test              # Run all tests
+pnpm test:coverage     # Coverage report (target: 80%+)
+pnpm lint              # ESLint check
+pnpm type-check        # TypeScript strict check
+pnpm db:migrate        # Run Prisma migrations
+pnpm db:studio         # Open Prisma Studio
+```
+
+## Project Structure
+
+```
+datascriba/
+├── apps/
+│   ├── api/        # NestJS REST API
+│   ├── web/        # Next.js 15 frontend
+│   └── worker/     # BullMQ job processor
+├── packages/
+│   ├── shared-types/    # Shared TypeScript types
+│   ├── report-engine/   # CSV/Excel rendering + parameter validation
+│   ├── db-drivers/      # MSSQL driver + crypto + query guard
+│   ├── ai-client/       # Anthropic SDK wrapper
+│   └── queue-config/    # BullMQ job schemas
+├── docker/
+├── docs/
+│   ├── api.md
+│   ├── architecture.md
+│   ├── deployment.md
+│   └── adr/
+└── .github/workflows/
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, agent workflow, and PR rules.
+
+## License
+
+Apache 2.0
+```
+
+---
+
+## STEP 8 — docs/architecture.md
+
+**Dosya:** `docs/architecture.md` — yoksa oluştur, varsa tamamen değiştir.
+
+**İçerik:**
+
+```markdown
+# DataScriba — System Architecture
+
+## Overview
+
+DataScriba follows a monorepo structure (Turborepo + pnpm workspaces) with three deployable
+applications and five shared packages.
+
+## System Diagram
+
+```mermaid
+graph TB
+    subgraph Client
+        WEB["Next.js 15\napps/web\n:3000"]
+    end
+
+    subgraph API
+        NEST["NestJS 10\napps/api\n:3001"]
+    end
+
+    subgraph Workers
+        WORKER["BullMQ Worker\napps/worker"]
+    end
+
+    subgraph Queue
+        REDIS[("Redis 7\nBullMQ")]
+    end
+
+    subgraph Storage
+        PG[("PostgreSQL 16\nPrisma ORM")]
+        FS["FileSystem\n./output/"]
+    end
+
+    subgraph External
+        ANTHROPIC["Anthropic API\nclaude-sonnet-4-6"]
+        MSSQL[("MSSQL Server\ncustomer DB")]
+    end
+
+    WEB -->|"REST + SSE"| NEST
+    NEST -->|"enqueue job"| REDIS
+    NEST -->|"CRUD"| PG
+    NEST -->|"AES-256-GCM conn strings"| MSSQL
+    NEST -->|"streaming"| ANTHROPIC
+    WORKER -->|"dequeue"| REDIS
+    WORKER -->|"execute query"| MSSQL
+    WORKER -->|"write CSV/XLSX"| FS
+```
+
+## Package Dependency Graph
+
+```mermaid
+graph LR
+    API["apps/api"] --> ST["shared-types"]
+    API --> RE["report-engine"]
+    API --> DB["db-drivers"]
+    API --> AI["ai-client"]
+    API --> QC["queue-config"]
+
+    WORKER["apps/worker"] --> ST
+    WORKER --> RE
+    WORKER --> DB
+    WORKER --> QC
+
+    WEB["apps/web"] --> ST
+
+    RE --> ST
+    DB --> ST
+    AI --> ST
+    QC --> ST
+```
+
+## Data Flow — Synchronous Report Execution
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant DS as DataSourceService
+    participant RE as report-engine
+    participant DB as MSSQL
+
+    C->>A: POST /reports/:id/run {format, parameters}
+    A->>A: validateParameters()
+    A->>A: renderTemplate(sql, params)
+    A->>DS: executeQuery(dataSourceId, sql, [])
+    DS->>DB: parameterized query
+    DB-->>DS: ResultSet
+    DS-->>A: QueryResult {columns, rows}
+    A->>RE: renderReport(data, {format})
+    RE-->>A: Buffer (CSV or XLSX)
+    A->>A: writeFileSync(outputPath, buffer)
+    A-->>C: 200 + Buffer + Content-Disposition
+```
+
+## Data Flow — Scheduled Report (Async)
+
+```mermaid
+sequenceDiagram
+    participant CRON as NestJS Cron
+    participant SCHED as ScheduleService
+    participant Q as BullMQ
+    participant W as Worker
+    participant DB as MSSQL
+    participant FS as FileSystem
+
+    CRON->>SCHED: dispatchDueSchedules() every minute
+    SCHED->>SCHED: find enabled where nextRunAt <= now
+    SCHED->>Q: queue.add('run-report', payload)
+    SCHED->>SCHED: update nextRunAt
+    Q->>W: job dequeued
+    W->>DB: execute query
+    DB-->>W: rows
+    W->>FS: write CSV/XLSX
+```
+
+## Data Flow — AI SQL Suggestion (Streaming SSE)
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as API
+    participant DS as DataSourceService
+    participant ANT as Anthropic API
+
+    C->>A: POST /ai/suggest-query {prompt, dataSourceId}
+    A->>DS: listTables() + describeTable()
+    DS-->>A: SchemaContext
+    A->>ANT: messages.stream() with schema context
+    ANT-->>A: streaming chunks
+    A-->>C: SSE data: {"type":"delta","text":"..."}
+    A-->>C: SSE data: {"type":"done"}
+```
+
+## Security Model
+
+| Concern | Mechanism |
+|---------|-----------|
+| Connection string storage | AES-256-GCM, key from `ENCRYPTION_MASTER_KEY` env |
+| Mutation prevention | `assertQueryAllowed()` blocks DROP/DELETE/TRUNCATE |
+| SQL injection | Parameterized queries at driver level |
+| AI rate limiting | ThrottlerModule (configurable RPM per IP) |
+| Response sanitization | `encryptedConnectionString` always redacted in API responses |
+
+## NestJS Module Structure
+
+```
+src/
+├── modules/
+│   ├── data-source/    CRUD + connection management
+│   ├── report/         CRUD + synchronous run
+│   ├── schedule/       CRUD + cron dispatch + manual trigger
+│   └── ai/             SSE streaming + explain endpoint
+├── health/             GET /health
+├── common/filters/     AppExceptionFilter (global)
+└── config/env.ts       Zod-validated environment
+```
+```
+
+---
+
+## STEP 9 — ADR Dosyaları
+
+### 9a — docs/adr/001-mssql-only.md
+
+```markdown
+# ADR-001: MSSQL-Only Database Driver
+
+**Date:** 2026-05  
+**Status:** Accepted  
+
+## Context
+
+DataScriba needs to connect to customer databases. Multiple database engines exist. The primary
+target user base for the initial release is enterprise teams running Microsoft SQL Server.
+
+## Decision
+
+Ship with MSSQL-only support using the `mssql` npm package. The driver factory uses a
+`DataSourceDriver` interface so future drivers slot in without changing callers.
+
+## Consequences
+
+**Positive:** Faster delivery, focused security review, strong parameterization via `Request.input()`.
+
+**Negative:** PostgreSQL/MySQL users cannot use DataScriba until additional drivers are added.
+
+## Future
+
+Add `PostgresDriver`, `MySqlDriver` implementing:
+
+```typescript
+interface DataSourceDriver {
+  test(): Promise<boolean>
+  listTables(): Promise<TableMeta[]>
+  describeTable(name: string): Promise<ColumnMeta[]>
+  execute(sql: string, params: unknown[]): Promise<QueryResult>
+  close(): Promise<void>
+}
+```
+```
+
+### 9b — docs/adr/002-in-memory-repo.md
+
+```markdown
+# ADR-002: In-Memory Repositories (Phases 2–6)
+
+**Date:** 2026-05  
+**Status:** Accepted (temporary)  
+
+## Context
+
+Prisma is included in the stack but setting up full DB migrations during early development phases
+adds bootstrap complexity. The goal of phases 2–6 is to deliver working business logic.
+
+## Decision
+
+All repositories (`DataSourceRepository`, `ReportRepository`, `ScheduleRepository`) use
+in-memory `Map<string, T>` storage during development phases.
+
+## Consequences
+
+**Positive:** Zero DB dependency to boot the API. Repository interface is clean — switching to
+Prisma only changes repository implementation, not service or controller code.
+
+**Negative:** Data lost on restart. No advanced queries (pagination, filtering, joins).
+
+## Migration Plan
+
+1. Define `schema.prisma` models.
+2. Run `prisma migrate dev`.
+3. Replace `Map` store in each repository with `prisma.<model>.<method>()`.
+4. Repository interface (`create`, `findAll`, `findById`, `update`, `delete`) stays identical.
+```
+
+### 9c — docs/adr/003-csv-excel-only.md
+
+```markdown
+# ADR-003: CSV and Excel Export Formats Only
+
+**Date:** 2026-05  
+**Status:** Accepted  
+
+## Context
+
+Formats considered: CSV, Excel, PDF, Word, HTML. PDF via Puppeteer requires a ~200 MB Chromium
+binary. Word/HTML add dependencies. Phase 3 prioritized speed and small Docker images.
+
+## Decision
+
+Phase 3 ships CSV and Excel (.xlsx) only. The `ReportRenderer` interface makes new formats
+additive:
+
+```typescript
+interface ReportRenderer {
+  readonly format: ExportFormat
+  render(data: ReportData, options: RenderOptions): Promise<Buffer>
+}
+```
+
+## Consequences
+
+**Positive:** Lean Docker images, small dependencies (ExcelJS + PapaParse), machine-readable outputs.
+
+**Negative:** No print-ready PDF in Phase 3.
+
+## Future
+
+Phase 9+: `PdfRenderer` via Puppeteer, `WordRenderer` via `docx` package.
+```
+
+---
+
+## STEP 10 — CONTRIBUTING.md
+
+**Dosya:** `CONTRIBUTING.md` — proje kök dizini. Yoksa oluştur, varsa tamamen değiştir.
+
+**İçerik:**
+
+```markdown
+# Contributing to DataScriba
+
+## Development Environment
+
+### Prerequisites
+
+| Tool | Version |
+|------|---------|
+| Node.js | 22 LTS |
+| pnpm | 9+ |
+| Docker | 24+ |
+| Docker Compose | v2 |
+
+### Setup
+
+```bash
+git clone https://github.com/your-org/datascriba.git
+cd datascriba
+pnpm install
+cp .env.example .env
+# Edit .env — set ENCRYPTION_MASTER_KEY and ANTHROPIC_API_KEY
+
+docker compose -f docker/docker-compose.yml up postgres redis -d
+
+# In separate terminals:
+pnpm --filter=api dev
+pnpm --filter=worker dev
+pnpm --filter=web dev
+```
+
+## Multi-Agent Workflow
+
+This project uses a 4-agent AI pipeline:
+
+```
+planner -> [user gate] -> builder -> reviewer -> tester -> done
+```
+
+| Agent | Responsibility |
+|-------|---------------|
+| planner | Analysis, task decomposition, TASK_PLAN.md |
+| builder | TypeScript implementation |
+| reviewer | Quality, security, correctness review |
+| tester | Test coverage verification |
+
+Key files: `TASK_PLAN.md` (planner), `PHASE_X_PROGRESS.md` (builder), `REVIEW.md` (reviewer), `TEST_REPORT.md` (tester).
+
+## Code Standards
+
+- TypeScript strict mode — no `any`, no `var`
+- `console.log` banned — use Pino logger
+- Named exports everywhere (Next.js page defaults excepted)
+- Never swallow errors — log and re-throw
+- Naming: `kebab-case` files, `PascalCase` classes, `camelCase` functions, `SCREAMING_SNAKE_CASE` constants
+
+## Running Tests
+
+```bash
+pnpm test                         # All tests
+pnpm test:coverage                # With coverage (target: 80%+)
+pnpm --filter=api test            # API unit tests
+pnpm --filter=api test:e2e        # API integration tests
+pnpm --filter=report-engine test  # Package tests
+```
+
+## Commit Convention
+
+[Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+feat: add PostgreSQL driver
+fix: prevent path traversal in report output
+chore: upgrade ExcelJS
+docs: update architecture diagram
+test: add csv-renderer edge cases
+BREAKING: rename ExportFormat
+```
+
+## PR Rules
+
+1. Every PR must include tests — reviewer will reject without coverage.
+2. Branch from `develop`, not `main`.
+3. Branch naming: `feat/<desc>`, `fix/<issue>`, `chore/<task>`.
+4. PR title follows Conventional Commits.
+5. Include: what changed and why, how to test, breaking changes flagged.
+6. Do not merge your own PR.
+
+## Architecture Decision Records
+
+For decisions affecting DB strategy, new heavy dependencies, API breaking changes, or security
+logic — create `docs/adr/00N-short-title.md` before implementing.
+```
+
+---
+
+## STEP 11 — docs/api.md
+
+**Dosya:** `docs/api.md` — yoksa oluştur, varsa tamamen değiştir.
+
+**İçerik:**
+
+```markdown
+# DataScriba API Reference
+
+Base URL: `http://localhost:3001/api/v1`  
+Interactive docs: `http://localhost:3001/api/docs` (Swagger UI)
+
+---
+
+## Data Sources
+
+### POST /data-sources
+
+Create a data source.
+
+**Request:**
+```json
+{
+  "name": "Production MSSQL",
+  "type": "mssql",
+  "host": "db.example.com",
+  "port": 1433,
+  "database": "sales",
+  "username": "reporter",
+  "password": "s3cret",
+  "encrypt": true,
+  "trustServerCertificate": false,
+  "connectionTimeoutMs": 30000
+}
+```
+
+**Response 201:**
+```json
+{
+  "id": "ds-uuid",
+  "name": "Production MSSQL",
+  "type": "mssql",
+  "host": "db.example.com",
+  "port": 1433,
+  "database": "sales",
+  "username": "reporter",
+  "encryptedConnectionString": "[REDACTED]",
+  "workspaceId": "default",
+  "createdAt": "2026-05-16T10:00:00.000Z",
+  "updatedAt": "2026-05-16T10:00:00.000Z"
+}
+```
+
+### GET /data-sources
+
+List all data sources (passwords always redacted).
+
+### GET /data-sources/:id
+
+Get one data source. **404** if not found.
+
+### PATCH /data-sources/:id
+
+Update. All fields optional.
+
+### DELETE /data-sources/:id
+
+**204** on success. **404** if not found.
+
+### POST /data-sources/:id/test
+
+Test database connection.
+
+**Response 200:** `{ "success": true }` or `{ "success": false, "error": "..." }`
+
+### GET /data-sources/:id/tables
+
+**Response 200:** `[{ "schema": "dbo", "name": "users", "type": "TABLE" }]`
+
+### GET /data-sources/:id/tables/:tableName/columns
+
+**Response 200:** `[{ "name": "id", "dataType": "int", "nullable": false, "isPrimaryKey": true, "defaultValue": null }]`
+
+---
+
+## Reports
+
+### POST /reports
+
+Create a report definition.
+
+**Request:**
+```json
+{
+  "name": "Monthly Sales",
+  "dataSourceId": "ds-uuid",
+  "query": "SELECT region, SUM(amount) AS total FROM sales WHERE month = {{month}} GROUP BY region",
+  "exportFormats": ["csv", "excel"],
+  "parameters": [
+    { "name": "month", "type": "string", "label": "Month", "required": true }
+  ]
+}
+```
+
+**Response 201:** ReportDefinition.
+
+### GET /reports
+
+List all reports.
+
+### GET /reports/:id
+
+Get one report. **404** if not found.
+
+### PATCH /reports/:id
+
+Update. All fields optional.
+
+### DELETE /reports/:id
+
+**204** on success.
+
+### POST /reports/:id/run
+
+Execute report synchronously. Returns file as binary.
+
+**Request:** `{ "format": "csv", "parameters": { "month": "2026-05" } }`
+
+**Response 200:**
+- CSV: `Content-Type: text/csv; charset=utf-8`
+- Excel: `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- `Content-Disposition: attachment; filename="<report-name>-<runId>.<ext>"`
+- Body: raw file bytes
+
+**Errors:** 400 invalid format, 400 missing required parameters, 404 report not found.
+
+### GET /reports/:id/runs
+
+Run history for a report.
+
+**Response 200:**
+```json
+[{
+  "id": "run-uuid",
+  "reportId": "rpt-uuid",
+  "status": "completed",
+  "format": "csv",
+  "parameters": {},
+  "startedAt": "2026-05-16T10:00:00.000Z",
+  "completedAt": "2026-05-16T10:00:02.000Z"
+}]
+```
+
+### GET /reports/:id/runs/:runId
+
+Get single run record.
+
+---
+
+## Schedules
+
+### POST /schedules
+
+Create a schedule. `cronExpression` validated by `cron-parser` — invalid expressions return 400.
+
+**Request:**
+```json
+{
+  "reportId": "rpt-uuid",
+  "cronExpression": "0 9 * * 1",
+  "format": "excel",
+  "enabled": true,
+  "notifyEmail": "manager@company.com"
+}
+```
+
+**Response 201:** ScheduleDefinition.
+
+### GET /schedules
+
+List all schedules.
+
+### GET /schedules/:id
+
+Get one schedule.
+
+### PATCH /schedules/:id
+
+Update. All fields optional.
+
+### DELETE /schedules/:id
+
+**204** on success.
+
+### POST /schedules/:id/trigger
+
+Manually enqueue a BullMQ job immediately.
+
+**Response 200:** `{ "jobId": "bullmq-job-id" }`
+
+---
+
+## AI (Scriba AI)
+
+All AI endpoints rate-limited (default: 10 RPM per IP, configurable via `AI_RATE_LIMIT_RPM`).
+
+### POST /ai/suggest-query
+
+**Content-Type (response):** `text/event-stream`
+
+**Request:** `{ "prompt": "Show total sales per region", "dataSourceId": "ds-uuid" }`
+
+**SSE events:**
+```
+data: {"type":"delta","text":"SELECT "}
+data: {"type":"delta","text":"region"}
+data: {"type":"done"}
+```
+
+| Event type | Fields | Meaning |
+|-----------|--------|---------|
+| `delta` | `text: string` | SQL token chunk |
+| `done` | — | Stream complete |
+| `error` | `error: string` | Error occurred |
+
+### POST /ai/explain-query
+
+Non-streaming. Explains SQL in Turkish and English.
+
+**Request:** `{ "sql": "SELECT * FROM users" }`
+
+**Response 200:**
+```json
+{
+  "turkish": "Bu sorgu tum kullanicilari getirir.",
+  "english": "This query retrieves all users.",
+  "model": "claude-sonnet-4-6"
+}
+```
+
+### POST /ai/fix-query
+
+**Content-Type (response):** `text/event-stream`
+
+**Request:** `{ "sql": "SELEC * FORM users", "errorMessage": "Incorrect syntax near SELEC" }`
+
+Same SSE format as `suggest-query`.
+
+---
+
+## Health
+
+### GET /health
+
+**Response 200:** `{ "status": "ok", "timestamp": "2026-05-16T10:00:00.000Z" }`
+```
+
+---
+
+## STEP 12 — docs/deployment.md
+
+**Dosya:** `docs/deployment.md` — yoksa oluştur, varsa tamamen değiştir.
+
+**İçerik:**
+
+```markdown
+# DataScriba Deployment Guide
+
+## Quick Deploy
+
+```bash
+git clone https://github.com/your-org/datascriba.git
+cd datascriba
+cp .env.example .env
+# Edit .env (see Environment Variables below)
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
+curl http://localhost:3001/health
+```
+
+## Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | Yes | — | PostgreSQL connection URL |
+| `REDIS_HOST` | Yes | `127.0.0.1` | Redis host |
+| `REDIS_PORT` | Yes | `6379` | Redis port |
+| `REDIS_PASSWORD` | No | — | Redis password (required in production) |
+| `ENCRYPTION_MASTER_KEY` | Yes | — | 64-char hex (32 bytes). `openssl rand -hex 32` |
+| `ANTHROPIC_API_KEY` | Yes | — | Anthropic API key |
+| `AI_MODEL` | No | `claude-sonnet-4-6` | Claude model ID |
+| `AI_RATE_LIMIT_RPM` | No | `10` | AI rate limit (req/min/IP) |
+| `API_PORT` | No | `3001` | API listen port |
+| `NODE_ENV` | No | `development` | Set to `production` for prod |
+| `BETTER_AUTH_SECRET` | Yes | — | 32+ char random string |
+| `BETTER_AUTH_URL` | Yes | — | Public API URL |
+| `NEXT_PUBLIC_API_URL` | Yes | — | Browser-facing API URL |
+| `INTERNAL_API_URL` | Yes | `http://localhost:3001` | Worker-to-API URL |
+| `SMTP_HOST` | No | — | SMTP host for notifications |
+| `SMTP_PORT` | No | `587` | SMTP port |
+| `SMTP_USER` | No | — | SMTP username |
+| `SMTP_PASS` | No | — | SMTP password |
+| `SMTP_FROM` | No | — | Notification from address |
+
+### Generating ENCRYPTION_MASTER_KEY
+
+```bash
+openssl rand -hex 32
+```
+
+Output is a 64-character hex string. Copy to `.env`.
+
+**CRITICAL:** Changing this key after creating data sources makes existing connection strings
+unreadable. Back up the key in a secrets manager.
+
+## Healthcheck Endpoints
+
+| Endpoint | Method | Expected |
+|----------|--------|---------|
+| `/health` | GET | `200 {"status":"ok"}` |
+
+Docker uses `wget -qO- http://localhost:3001/health` with 30s interval.
+
+## Production Checklist
+
+- [ ] `NODE_ENV=production`
+- [ ] `ENCRYPTION_MASTER_KEY` is a fresh value (not the example)
+- [ ] `REDIS_PASSWORD` is strong and set
+- [ ] `BETTER_AUTH_SECRET` is random and long
+- [ ] `ANTHROPIC_API_KEY` is valid
+- [ ] HTTPS termination via reverse proxy (nginx, Caddy, Traefik)
+- [ ] Firewall: only expose ports 3000 (web) and 3001 (API) externally
+- [ ] Docker volumes backed up regularly (postgres_data, redis_data, report_output)
+
+## Updating
+
+```bash
+git pull
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml pull
+docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d --no-deps api worker
+```
+
+## Logs
+
+```bash
+docker compose logs -f api
+docker compose logs -f worker
+```
+```
+
+---
+
+## STEP 13 — docker/docker-compose.prod.yml
+
+**Dosya:** `docker/docker-compose.prod.yml` — YENİ DOSYA.
+
+**İçerik:**
 
 ```yaml
+# docker/docker-compose.prod.yml
+# Production overrides. Use together with docker-compose.yml:
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d
 version: '3.9'
 
 services:
   postgres:
-    image: postgres:16-alpine
-    container_name: datascriba-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: datascriba
-      POSTGRES_PASSWORD: datascriba
-      POSTGRES_DB: datascriba
-    ports:
-      - '5432:5432'
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U datascriba -d datascriba']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    restart: always
+    # Do not expose PostgreSQL port externally in production
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   redis:
-    image: redis:7-alpine
-    container_name: datascriba-redis
-    restart: unless-stopped
-    ports:
-      - '6379:6379'
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 5s
+    restart: always
+    # Do not expose Redis port externally in production
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   api:
-    build:
-      context: ..
-      dockerfile: apps/api/Dockerfile
-    container_name: datascriba-api
-    restart: unless-stopped
-    env_file: ../.env
+    restart: always
     environment:
       NODE_ENV: production
-      REDIS_HOST: redis
-      REDIS_PORT: '6379'
-    ports:
-      - '${API_PORT:-3001}:3001'
-    depends_on:
-      redis:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ['CMD', 'wget', '-qO-', 'http://localhost:3001/health']
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+    # No source bind mounts in production — only built image
+    volumes: []
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1.0'
 
   worker:
-    build:
-      context: ..
-      dockerfile: apps/worker/Dockerfile
-    container_name: datascriba-worker
-    restart: unless-stopped
-    env_file: ../.env
+    restart: always
     environment:
       NODE_ENV: production
-      REDIS_HOST: redis
-      REDIS_PORT: '6379'
-      INTERNAL_API_URL: http://api:3001
-    depends_on:
-      redis:
-        condition: service_healthy
-      api:
-        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: '1.0'
     volumes:
       - report_output:/app/output
-
-volumes:
-  postgres_data:
-  redis_data:
-  report_output:
 ```
 
-### 6.2 — `docker/docker-compose.dev.yml` (YENİ)
+---
 
-```yaml
-version: '3.9'
+## STEP 14 — Dockerfile Production Stage Güncellemeleri
 
-# Development override — mount source for hot reload
-# Usage: docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up
+### apps/api/Dockerfile
 
-services:
-  api:
-    build:
-      target: development
-    environment:
-      NODE_ENV: development
-    volumes:
-      - ../apps/api:/app/apps/api
-      - ../packages:/app/packages
-      - /app/node_modules
-    command: pnpm --filter=api dev
-
-  worker:
-    build:
-      target: development
-    environment:
-      NODE_ENV: development
-    volumes:
-      - ../apps/worker:/app/apps/worker
-      - ../packages:/app/packages
-      - /app/node_modules
-    command: pnpm --filter=worker dev
-```
-
-### 6.3 — `apps/api/Dockerfile`
+Mevcut dosyada `# Production` yorum satırından itibaren dosya sonuna kadar olan bölümü aşağıdakiyle değiştir:
 
 ```dockerfile
-# syntax=docker/dockerfile:1
-FROM node:22-alpine AS base
-RUN corepack enable pnpm
-
-# Dependencies
-FROM base AS deps
-WORKDIR /app
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
-COPY apps/api/package.json ./apps/api/
-COPY packages/shared-types/package.json ./packages/shared-types/
-COPY packages/report-engine/package.json ./packages/report-engine/
-COPY packages/db-drivers/package.json ./packages/db-drivers/
-COPY packages/ai-client/package.json ./packages/ai-client/
-COPY packages/queue-config/package.json ./packages/queue-config/
-COPY packages/tsconfig/package.json ./packages/tsconfig/
-COPY packages/eslint-config/package.json ./packages/eslint-config/
-RUN pnpm install --frozen-lockfile --ignore-scripts
-
-# Builder
-FROM deps AS builder
-WORKDIR /app
-COPY . .
-RUN pnpm --filter=@datascriba/tsconfig build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/shared-types build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/queue-config build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/db-drivers build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/report-engine build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/ai-client build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/api build
-
-# Development
-FROM deps AS development
-WORKDIR /app
-COPY . .
-EXPOSE 3001
-CMD ["pnpm", "--filter=api", "dev"]
-
 # Production
 FROM node:22-alpine AS production
 RUN corepack enable pnpm
@@ -1954,49 +2185,24 @@ COPY --from=builder --chown=node:nodejs /app/packages ./packages
 COPY --from=builder --chown=node:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=node:nodejs /app/package.json ./
 COPY --from=builder --chown=node:nodejs /app/pnpm-workspace.yaml ./
+COPY --from=builder --chown=node:nodejs /app/pnpm-lock.yaml ./
+
+# Remove devDependencies to shrink image
+RUN pnpm prune --prod --no-optional && \
+    rm -rf /root/.cache /root/.local /tmp/*
 
 USER node
 EXPOSE 3001
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:3001/health || exit 1
 CMD ["node", "apps/api/dist/main"]
 ```
 
-### 6.4 — `apps/worker/Dockerfile`
+### apps/worker/Dockerfile
+
+Mevcut dosyada `# Production` yorum satırından itibaren dosya sonuna kadar olan bölümü aşağıdakiyle değiştir:
 
 ```dockerfile
-# syntax=docker/dockerfile:1
-FROM node:22-alpine AS base
-RUN corepack enable pnpm
-
-# Dependencies
-FROM base AS deps
-WORKDIR /app
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
-COPY apps/worker/package.json ./apps/worker/
-COPY packages/shared-types/package.json ./packages/shared-types/
-COPY packages/report-engine/package.json ./packages/report-engine/
-COPY packages/db-drivers/package.json ./packages/db-drivers/
-COPY packages/queue-config/package.json ./packages/queue-config/
-COPY packages/tsconfig/package.json ./packages/tsconfig/
-COPY packages/eslint-config/package.json ./packages/eslint-config/
-RUN pnpm install --frozen-lockfile --ignore-scripts
-
-# Builder
-FROM deps AS builder
-WORKDIR /app
-COPY . .
-RUN pnpm --filter=@datascriba/tsconfig build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/shared-types build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/queue-config build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/db-drivers build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/report-engine build 2>/dev/null || true
-RUN pnpm --filter=@datascriba/worker build
-
-# Development
-FROM deps AS development
-WORKDIR /app
-COPY . .
-CMD ["pnpm", "--filter=worker", "dev"]
-
 # Production
 FROM node:22-alpine AS production
 RUN corepack enable pnpm
@@ -2011,166 +2217,56 @@ COPY --from=builder --chown=node:nodejs /app/packages ./packages
 COPY --from=builder --chown=node:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=node:nodejs /app/package.json ./
 COPY --from=builder --chown=node:nodejs /app/pnpm-workspace.yaml ./
+COPY --from=builder --chown=node:nodejs /app/pnpm-lock.yaml ./
+
+# Remove devDependencies to shrink image
+RUN pnpm prune --prod --no-optional && \
+    rm -rf /root/.cache /root/.local /tmp/*
 
 USER node
+HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
+  CMD pgrep -f "node apps/worker/dist/main" || exit 1
 CMD ["node", "apps/worker/dist/main"]
-```
-
-### 6.5 — `.env.example` Guncellemesi (root dizininde)
-
-Mevcut dosyaya su bloklari ekle:
-
-```ini
-# Queue / Redis
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-# REDIS_PASSWORD=
-
-# Worker — Internal API
-INTERNAL_API_URL=http://localhost:3001
-
-# SMTP (optional — report email notifications)
-# SMTP_HOST=smtp.example.com
-# SMTP_PORT=587
-# SMTP_USER=user@example.com
-# SMTP_PASS=your-password
-# SMTP_FROM=no-reply@datascriba.io
 ```
 
 ---
 
-## STEP 7 — CI/CD: GitHub Actions
+## STEP 15 — .github/workflows/deploy.yml
 
-**Amaç:** Push/PR'da lint + type-check + test; main'e merge sonrasi Docker image build + push.
-**Bagımlılıklar:** STEP 6 (Dockerfile'lar mevcut olmali)
+**Dosya:** `.github/workflows/deploy.yml` — YENİ DOSYA.
 
-### 7.1 — `.github/workflows/ci.yml`
+**İçerik:**
 
 ```yaml
-name: CI
+name: Deploy — Production Release
 
 on:
   push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
+    tags:
+      - 'v*'
 
 env:
   NODE_VERSION: '22'
   PNPM_VERSION: '9'
-
-jobs:
-  lint-typecheck:
-    name: Lint & Type Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build shared packages
-        run: |
-          pnpm --filter=@datascriba/tsconfig build || true
-          pnpm --filter=@datascriba/shared-types build || true
-          pnpm --filter=@datascriba/queue-config build || true
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Type check
-        run: pnpm type-check
-
-  test:
-    name: Unit Tests
-    runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      NODE_ENV: test
-      REDIS_HOST: 127.0.0.1
-      REDIS_PORT: 6379
-      ENCRYPTION_MASTER_KEY: 0000000000000000000000000000000000000000000000000000000000000000
-      ANTHROPIC_API_KEY: test-key
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: ${{ env.PNPM_VERSION }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Build shared packages
-        run: |
-          pnpm --filter=@datascriba/tsconfig build || true
-          pnpm --filter=@datascriba/shared-types build || true
-          pnpm --filter=@datascriba/queue-config build || true
-          pnpm --filter=@datascriba/report-engine build || true
-          pnpm --filter=@datascriba/db-drivers build || true
-
-      - name: Run tests
-        run: pnpm test
-
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: '**/coverage/**'
-          retention-days: 7
-```
-
-### 7.2 — `.github/workflows/deploy.yml`
-
-```yaml
-name: Deploy
-
-on:
-  push:
-    branches: [main]
-
-env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository_owner }}/datascriba
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-push:
-    name: Build & Push Docker Images
+  build-and-push:
+    name: Build and Push Docker Images
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        app: [api, worker]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
+      - name: Extract version tag
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -2180,432 +2276,375 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.app }}
-          tags: |
-            type=sha,prefix=sha-
-            type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push ${{ matrix.app }}
+      - name: Build and push API image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/${{ matrix.app }}/Dockerfile
+          file: apps/api/Dockerfile
           target: production
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api:${{ steps.tag.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/api:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/worker/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/worker:${{ steps.tag.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version tag
+        id: tag
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" | head -30)
+          else
+            CHANGELOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)")
+          fi
+          {
+            echo 'changelog<<EOF'
+            echo "$CHANGELOG"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: DataScriba ${{ steps.tag.outputs.version }}
+          body: |
+            ## DataScriba ${{ steps.tag.outputs.version }}
+
+            ### Docker Images
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}/api:${{ steps.tag.outputs.version }}
+            docker pull ghcr.io/${{ github.repository }}/worker:${{ steps.tag.outputs.version }}
+            ```
+
+            ### Changes
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Deployment
+
+            See [docs/deployment.md](docs/deployment.md) for full instructions.
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.version, '-') }}
 ```
 
 ---
 
-## STEP 8 — Unit Testler
+## STEP 16 — .env.example Tam Yenileme
 
-**Amaç:** Her yeni servis için birim testleri olusturmak.
-**Bagımlılıklar:** STEP 3, STEP 4 tamamlanmis olmali
+Mevcut `.env.example` dosyasını tamamen şununla değiştir:
 
-### 8.1 — `apps/api/src/modules/schedule/schedule.service.spec.ts`
+```bash
+# =============================================================================
+# DataScriba — Environment Configuration
+# Copy to .env and fill in values. NEVER commit .env.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Database (PostgreSQL)
+# -----------------------------------------------------------------------------
+DATABASE_URL=postgresql://datascriba:datascriba@localhost:5432/datascriba
+
+# -----------------------------------------------------------------------------
+# Redis
+# -----------------------------------------------------------------------------
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+# REDIS_PASSWORD=        # Required in production
+
+# -----------------------------------------------------------------------------
+# Application
+# -----------------------------------------------------------------------------
+NODE_ENV=development
+API_PORT=3001
+API_HOST=0.0.0.0
+
+# -----------------------------------------------------------------------------
+# Encryption
+# Generate with: openssl rand -hex 32
+# CRITICAL: Back this up. Changing it makes existing connection strings unreadable.
+# -----------------------------------------------------------------------------
+ENCRYPTION_MASTER_KEY=change-this-to-64-hex-chars-run-openssl-rand-hex-32-and-paste-here
+
+# -----------------------------------------------------------------------------
+# Authentication (Better-Auth)
+# Generate with: openssl rand -base64 32
+# -----------------------------------------------------------------------------
+BETTER_AUTH_SECRET=change-this-to-a-random-32-plus-char-string
+BETTER_AUTH_URL=http://localhost:3001
+
+# -----------------------------------------------------------------------------
+# Frontend (Next.js) — browser-facing API URL
+# -----------------------------------------------------------------------------
+NEXT_PUBLIC_API_URL=http://localhost:3001
+
+# -----------------------------------------------------------------------------
+# Scriba AI (Anthropic)
+# Get key from: https://console.anthropic.com/
+# -----------------------------------------------------------------------------
+ANTHROPIC_API_KEY=sk-ant-...
+AI_MODEL=claude-sonnet-4-6
+AI_RATE_LIMIT_RPM=10
+
+# -----------------------------------------------------------------------------
+# Worker
+# -----------------------------------------------------------------------------
+INTERNAL_API_URL=http://localhost:3001
+
+# -----------------------------------------------------------------------------
+# SMTP (optional — report email notifications)
+# -----------------------------------------------------------------------------
+# SMTP_HOST=smtp.example.com
+# SMTP_PORT=587
+# SMTP_USER=notifications@example.com
+# SMTP_PASS=your-smtp-password
+# SMTP_FROM=no-reply@datascriba.io
+```
+
+---
+
+## STEP 17 — CI ve E2E Config
+
+### 17a — apps/api/vitest.e2e.config.ts (YENİ DOSYA)
 
 ```typescript
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { Test } from '@nestjs/testing'
-import { getQueueToken } from '@nestjs/bullmq'
-import { BadRequestException, NotFoundException } from '@nestjs/common'
-import { QUEUE_NAME } from '@datascriba/queue-config'
-import { ScheduleService } from './schedule.service'
-import { ScheduleRepository } from './schedule.repository'
+// apps/api/vitest.e2e.config.ts
+import swc from 'unplugin-swc'
+import { defineConfig } from 'vitest/config'
 
-const mockQueue = {
-  add: vi.fn().mockResolvedValue({ id: 'job-1' }),
-}
-
-const mockRepository = {
-  findAll: vi.fn().mockResolvedValue([]),
-  findById: vi.fn(),
-  findEnabled: vi.fn().mockResolvedValue([]),
-  create: vi.fn(),
-  update: vi.fn(),
-  delete: vi.fn(),
-}
-
-describe('ScheduleService', () => {
-  let service: ScheduleService
-
-  beforeEach(async () => {
-    vi.clearAllMocks()
-    const module = await Test.createTestingModule({
-      providers: [
-        ScheduleService,
-        { provide: ScheduleRepository, useValue: mockRepository },
-        { provide: getQueueToken(QUEUE_NAME), useValue: mockQueue },
-      ],
-    }).compile()
-
-    service = module.get(ScheduleService)
-  })
-
-  describe('create()', () => {
-    it('throws BadRequestException for invalid cron', async () => {
-      await expect(
-        service.create({
-          reportId: crypto.randomUUID(),
-          cronExpression: 'not-a-cron',
-          format: 'csv',
-        }),
-      ).rejects.toBeInstanceOf(BadRequestException)
-    })
-
-    it('creates a schedule with valid cron', async () => {
-      const id = crypto.randomUUID()
-      mockRepository.create.mockResolvedValueOnce({
-        id,
-        reportId: crypto.randomUUID(),
-        cronExpression: '0 8 * * 1-5',
-        format: 'csv',
-        parameters: {},
-        enabled: true,
-        nextRunAt: new Date(),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-
-      const result = await service.create({
-        reportId: crypto.randomUUID(),
-        cronExpression: '0 8 * * 1-5',
-        format: 'csv',
-      })
-
-      expect(result.id).toBe(id)
-    })
-  })
-
-  describe('findOne()', () => {
-    it('throws NotFoundException when schedule is missing', async () => {
-      mockRepository.findById.mockResolvedValueOnce(null)
-      await expect(service.findOne('missing-id')).rejects.toBeInstanceOf(NotFoundException)
-    })
-  })
-
-  describe('trigger()', () => {
-    it('adds job to queue and returns jobId', async () => {
-      const scheduleId = crypto.randomUUID()
-      const reportId = crypto.randomUUID()
-      mockRepository.findById.mockResolvedValueOnce({
-        id: scheduleId,
-        reportId,
-        cronExpression: '0 8 * * 1-5',
-        format: 'csv',
-        parameters: {},
-        enabled: true,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-
-      const result = await service.trigger(scheduleId)
-      expect(result.jobId).toBe('job-1')
-      expect(mockQueue.add).toHaveBeenCalledWith(
-        'run-report',
-        expect.objectContaining({ scheduleId, triggeredBy: 'manual' }),
-      )
-    })
-  })
-
-  describe('dispatchDueSchedules()', () => {
-    it('enqueues jobs for overdue schedules', async () => {
-      const scheduleId = crypto.randomUUID()
-      const past = new Date(Date.now() - 60_000)
-
-      mockRepository.findEnabled.mockResolvedValueOnce([
-        {
-          id: scheduleId,
-          reportId: crypto.randomUUID(),
-          cronExpression: '* * * * *',
-          format: 'excel',
-          parameters: {},
-          enabled: true,
-          nextRunAt: past,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        },
-      ])
-      mockRepository.update.mockResolvedValue({})
-
-      await service.dispatchDueSchedules()
-
-      expect(mockQueue.add).toHaveBeenCalledWith(
-        'run-report',
-        expect.objectContaining({ scheduleId, triggeredBy: 'scheduler' }),
-      )
-    })
-
-    it('skips schedules where nextRunAt is in the future', async () => {
-      const future = new Date(Date.now() + 3_600_000)
-      mockRepository.findEnabled.mockResolvedValueOnce([
-        {
-          id: crypto.randomUUID(),
-          reportId: crypto.randomUUID(),
-          cronExpression: '0 0 * * *',
-          format: 'csv',
-          parameters: {},
-          enabled: true,
-          nextRunAt: future,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        },
-      ])
-
-      await service.dispatchDueSchedules()
-      expect(mockQueue.add).not.toHaveBeenCalled()
-    })
-  })
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: 'node',
+    include: ['src/**/*.e2e-spec.ts'],
+    testTimeout: 30_000,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json', 'html'],
+      exclude: ['dist/**', 'node_modules/**', '**/*.e2e-spec.ts'],
+    },
+  },
+  plugins: [
+    swc.vite({
+      jsc: {
+        parser: { syntax: 'typescript', decorators: true },
+        transform: { decoratorMetadata: true, legacyDecorator: true },
+        target: 'es2022',
+      },
+    }),
+  ],
 })
 ```
 
-### 8.2 — `packages/queue-config/src/run-report-job.schema.spec.ts`
+### 17b — apps/api/package.json script ekleme
 
-```typescript
-import { describe, it, expect } from 'vitest'
-import { RunReportJobSchema } from './run-report-job.schema'
-
-describe('RunReportJobSchema', () => {
-  it('validates a correct payload', () => {
-    const payload = {
-      scheduleId: crypto.randomUUID(),
-      reportId: crypto.randomUUID(),
-      format: 'csv',
-      parameters: { month: '2026-01' },
-      notifyEmail: 'user@example.com',
-      triggeredBy: 'scheduler',
-      triggeredAt: new Date().toISOString(),
-    }
-    expect(RunReportJobSchema.parse(payload)).toMatchObject({ format: 'csv' })
-  })
-
-  it('rejects invalid format', () => {
-    expect(() =>
-      RunReportJobSchema.parse({
-        scheduleId: crypto.randomUUID(),
-        reportId: crypto.randomUUID(),
-        format: 'pdf',
-        triggeredBy: 'manual',
-        triggeredAt: new Date().toISOString(),
-      }),
-    ).toThrow()
-  })
-
-  it('rejects invalid email', () => {
-    expect(() =>
-      RunReportJobSchema.parse({
-        scheduleId: crypto.randomUUID(),
-        reportId: crypto.randomUUID(),
-        format: 'excel',
-        notifyEmail: 'not-an-email',
-        triggeredBy: 'scheduler',
-        triggeredAt: new Date().toISOString(),
-      }),
-    ).toThrow()
-  })
-
-  it('defaults parameters to empty object', () => {
-    const result = RunReportJobSchema.parse({
-      scheduleId: crypto.randomUUID(),
-      reportId: crypto.randomUUID(),
-      format: 'excel',
-      triggeredBy: 'manual',
-      triggeredAt: new Date().toISOString(),
-    })
-    expect(result.parameters).toEqual({})
-  })
-
-  it('rejects non-UUID scheduleId', () => {
-    expect(() =>
-      RunReportJobSchema.parse({
-        scheduleId: 'not-a-uuid',
-        reportId: crypto.randomUUID(),
-        format: 'csv',
-        triggeredBy: 'manual',
-        triggeredAt: new Date().toISOString(),
-      }),
-    ).toThrow()
-  })
-})
-```
-
----
-
-## STEP 9 — Health Check Endpoint (API)
-
-**Amaç:** Worker'ın `depends_on: api condition: service_healthy` çalısabilmesi için API'ye health check eklemek.
-**Bagımlılıklar:** STEP 3
-
-### 9.1 — `apps/api/src/health/health.controller.ts` (YENİ)
-
-```typescript
-import { Controller, Get, HttpCode, HttpStatus } from '@nestjs/common'
-import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger'
-
-interface HealthResponse {
-  status: 'ok'
-  timestamp: string
-}
-
-@ApiTags('Health')
-@Controller('health')
-export class HealthController {
-  @Get()
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'API health check' })
-  @ApiOkResponse({ description: 'Service is healthy' })
-  check(): HealthResponse {
-    return { status: 'ok', timestamp: new Date().toISOString() }
-  }
-}
-```
-
-`HealthController`'ın `app.module.ts` `controllers` dizisine eklenmesi STEP 3.10'da gösterildi.
-
----
-
-## STEP 10 — Turbo & Root Package.json Guncellemeleri
-
-**Amaç:** Root package.json'a yeni script'leri eklemek.
-**Bagımlılıklar:** STEP 1, STEP 4
-
-### 10.1 — Root `package.json` scripts (GUNCELLE)
-
-Mevcut `scripts` bölümüne su satirlari ekle:
+`apps/api/package.json` dosyasında `"scripts"` objesine şu satırı ekle:
 
 ```json
-"docker:dev": "docker compose -f docker/docker-compose.yml -f docker/docker-compose.dev.yml up -d",
-"worker:dev": "pnpm --filter=@datascriba/worker dev",
-"worker:build": "pnpm --filter=@datascriba/worker build"
+"test:e2e": "vitest run --config vitest.e2e.config.ts"
 ```
 
-`turbo.json` — ek degisiklik gerekmez. Mevcut yapilandirma `apps/*` altindaki tüm uygulamalar için otomatik çalisir.
+### 17c — .github/workflows/ci.yml job ekleme
+
+Mevcut `ci.yml` dosyasında son job'dan (`test:` satırının closure'u) sonra, aynı hizayla yeni bir job ekle:
+
+```yaml
+  integration-tests:
+    name: Integration Tests (E2E)
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      ENCRYPTION_MASTER_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      ANTHROPIC_API_KEY: test-key
+      AI_MODEL: claude-sonnet-4-6
+      AI_RATE_LIMIT_RPM: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter=@datascriba/tsconfig build || true
+          pnpm --filter=@datascriba/shared-types build || true
+          pnpm --filter=@datascriba/queue-config build || true
+          pnpm --filter=@datascriba/db-drivers build || true
+          pnpm --filter=@datascriba/report-engine build || true
+          pnpm --filter=@datascriba/ai-client build || true
+
+      - name: Run API integration tests
+        run: pnpm --filter=api test:e2e
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-coverage
+          path: 'apps/api/coverage/**'
+          retention-days: 7
+```
 
 ---
 
-## Implementasyon Sirasi (Builder Icin)
+## STEP 18 — Swagger Dekoratör Denetimi ve Tamamlama
 
-Builder bu adımları bagımlılık sirasına göre uygular:
+### Kontrol listesi (her controller için)
+
+Builder her controller dosyasını açacak ve eksik dekoratörleri ekleyecek:
+
+| Controller dosyası | Kontrol |
+|-------------------|--------|
+| `apps/api/src/modules/data-source/data-source.controller.ts` | Her method: `@ApiOperation({ summary: '...' })` + `@ApiResponse({ status: X, description: '...' })` |
+| `apps/api/src/modules/report/report.controller.ts` | Aynı |
+| `apps/api/src/modules/schedule/schedule.controller.ts` | Aynı |
+| `apps/api/src/modules/ai/ai.controller.ts` | SSE metodlara `@ApiProduces('text/event-stream')` ekle |
+
+### AI Controller eklenmesi gereken import ve dekoratörler
+
+`apps/api/src/modules/ai/ai.controller.ts` dosyasında:
+
+1. Import satırına `ApiProduces` ekle:
+```typescript
+import {
+  ApiBody,
+  ApiOkResponse,
+  ApiOperation,
+  ApiProduces,
+  ApiTags,
+} from '@nestjs/swagger'
+```
+
+2. `suggestQuery` metoduna `@ApiProduces` ekle:
+```typescript
+@Sse('suggest-query')
+@ApiOperation({ summary: 'Generate SQL from natural language (streaming SSE)' })
+@ApiBody({ type: SuggestQueryDto })
+@ApiProduces('text/event-stream')
+@ApiOkResponse({
+  description: 'SSE stream. Events: {"type":"delta","text":"..."} or {"type":"done"}',
+  schema: { type: 'string' },
+})
+suggestQuery(@Body() dto: SuggestQueryDto): Observable<MessageEvent> {
+```
+
+3. `fixQuery` metoduna aynı pattern'ı uygula:
+```typescript
+@Sse('fix-query')
+@ApiOperation({ summary: 'Fix a broken SQL query (streaming SSE)' })
+@ApiBody({ type: FixQueryDto })
+@ApiProduces('text/event-stream')
+@ApiOkResponse({
+  description: 'SSE stream of corrected SQL tokens',
+  schema: { type: 'string' },
+})
+fixQuery(@Body() dto: FixQueryDto): Observable<MessageEvent> {
+```
+
+---
+
+## Uygulama Sırası
 
 ```
-STEP 1  (queue-config paketi)
-  -> STEP 2  (shared-types güncellemesi)
-  -> STEP 9  (health controller)
-  -> STEP 3  (API schedule modülü — STEP 9 ile birlikte)
-  -> STEP 4  (worker uygulamasi)
-  -> STEP 5  (frontend UI)
-  -> STEP 6  (Docker)
-  -> STEP 7  (CI/CD)
-  -> STEP 8  (testler — son adim)
-  -> STEP 10 (root package.json)
+STEP 1  → apps/api/src/modules/data-source/data-source.e2e-spec.ts  (YENİ)
+STEP 2  → apps/api/src/modules/report/report.e2e-spec.ts             (YENİ)
+STEP 3  → apps/api/src/modules/schedule/schedule.e2e-spec.ts         (YENİ)
+STEP 4  → apps/api/src/modules/ai/ai.e2e-spec.ts                     (YENİ)
+STEP 5  → apps/web/src/hooks/use-ai.test.ts                          (YENİ)
+          apps/web/vitest.config.ts                                   (YENİ — yoksa)
+          apps/web/src/test-setup.ts                                  (YENİ — yoksa)
+STEP 6  → apps/web/src/components/ai/ai-assistant-panel.test.tsx     (YENİ)
+STEP 7  → README.md                                                   (TAM YENİLEME)
+STEP 8  → docs/architecture.md                                        (YENİ/YENİLEME)
+STEP 9a → docs/adr/001-mssql-only.md                                 (YENİ)
+STEP 9b → docs/adr/002-in-memory-repo.md                             (YENİ)
+STEP 9c → docs/adr/003-csv-excel-only.md                             (YENİ)
+STEP 10 → CONTRIBUTING.md                                             (YENİ/YENİLEME)
+STEP 11 → docs/api.md                                                 (YENİ/YENİLEME)
+STEP 12 → docs/deployment.md                                          (YENİ/YENİLEME)
+STEP 13 → docker/docker-compose.prod.yml                             (YENİ)
+STEP 14 → apps/api/Dockerfile  (production stage değişimi)
+          apps/worker/Dockerfile (production stage değişimi)
+STEP 15 → .github/workflows/deploy.yml                               (YENİ)
+STEP 16 → .env.example                                               (TAM YENİLEME)
+STEP 17 → apps/api/vitest.e2e.config.ts                              (YENİ)
+          apps/api/package.json  (test:e2e script ekleme)
+          .github/workflows/ci.yml  (integration-tests job ekleme)
+STEP 18 → apps/api/src/modules/ai/ai.controller.ts  (ApiProduces ekle)
+          + diğer controller'lar denetim
 ```
 
-STEP 3 ve STEP 9 paralel uygulanabilir. STEP 5 ve STEP 6 da birbirinden bagimsizdir.
+---
+
+## Dokunulmayacak Dosyalar
+
+Aşağıdaki test dosyaları zaten mevcut ve geçiyor — üzerine yazma:
+
+- `packages/report-engine/src/parameters.spec.ts`
+- `packages/report-engine/src/renderers/csv.renderer.spec.ts`
+- `packages/report-engine/src/renderers/excel.renderer.spec.ts`
+- `packages/db-drivers/src/crypto.spec.ts`
+- `packages/db-drivers/src/query-guard.spec.ts`
 
 ---
 
-## Dosya Degisiklik Ozeti
+## Coverage Doğrulama (Son Adım)
 
-### Yeni Dosyalar (Toplam: 34)
+Builder tüm adımları tamamladıktan sonra:
 
-| Dosya | STEP |
-|-------|------|
-| `packages/queue-config/package.json` | 1.1 |
-| `packages/queue-config/tsconfig.json` | 1.2 |
-| `packages/queue-config/src/index.ts` | 1.3 |
-| `packages/queue-config/src/queue.config.ts` | 1.4 |
-| `packages/queue-config/src/run-report-job.schema.ts` | 1.5 |
-| `packages/queue-config/src/run-report-job.schema.spec.ts` | 8.2 |
-| `packages/shared-types/src/schedule.ts` | 2.1 |
-| `apps/api/src/modules/schedule/dto/create-schedule.dto.ts` | 3.3 |
-| `apps/api/src/modules/schedule/dto/update-schedule.dto.ts` | 3.4 |
-| `apps/api/src/modules/schedule/schedule.repository.ts` | 3.5 |
-| `apps/api/src/modules/schedule/schedule.service.ts` | 3.6 |
-| `apps/api/src/modules/schedule/schedule.controller.ts` | 3.7 |
-| `apps/api/src/modules/schedule/email.service.ts` | 3.8 |
-| `apps/api/src/modules/schedule/schedule.module.ts` | 3.9 |
-| `apps/api/src/modules/schedule/schedule.service.spec.ts` | 8.1 |
-| `apps/api/src/health/health.controller.ts` | 9.1 |
-| `apps/worker/package.json` | 4.1 |
-| `apps/worker/tsconfig.json` | 4.2 |
-| `apps/worker/tsconfig.build.json` | 4.3 |
-| `apps/worker/nest-cli.json` | 4.4 |
-| `apps/worker/src/config/worker-env.ts` | 4.5 |
-| `apps/worker/src/processors/run-report.processor.ts` | 4.6 |
-| `apps/worker/src/services/report-runner.service.ts` | 4.7 |
-| `apps/worker/src/services/email.service.ts` | 4.8 |
-| `apps/worker/src/worker.module.ts` | 4.9 |
-| `apps/worker/src/main.ts` | 4.10 |
-| `apps/web/src/hooks/use-schedules.ts` | 5.1 |
-| `apps/web/src/app/[locale]/schedules/page.tsx` | 5.4 |
-| `apps/web/src/app/[locale]/schedules/schedules-client.tsx` | 5.5 |
-| `apps/web/src/app/[locale]/schedules/create-schedule-dialog.tsx` | 5.6 |
-| `docker/docker-compose.dev.yml` | 6.2 |
-| `apps/api/Dockerfile` | 6.3 |
-| `apps/worker/Dockerfile` | 6.4 |
-| `.github/workflows/ci.yml` | 7.1 |
-| `.github/workflows/deploy.yml` | 7.2 |
+```bash
+# Package coverage
+pnpm --filter=@datascriba/report-engine test:coverage
+pnpm --filter=@datascriba/db-drivers test:coverage
 
-### Guncellenen Dosyalar (Toplam: 9)
+# API unit + e2e
+pnpm --filter=api test:coverage
+pnpm --filter=api test:e2e
 
-| Dosya | STEP | Degisiklik |
-|-------|------|-----------|
-| `packages/shared-types/src/index.ts` | 2.2 | schedule export eklendi |
-| `apps/api/src/config/env.ts` | 3.2 | Redis + SMTP env degiskenleri |
-| `apps/api/package.json` | 3.1 | BullMQ, nodemailer, handlebars bagımlılıkları |
-| `apps/api/src/app.module.ts` | 3.10 | BullMQModule, NestScheduleModule, ScheduleModule, HealthController |
-| `apps/web/src/i18n/messages/en.json` | 5.2 | schedule namespace |
-| `apps/web/src/i18n/messages/tr.json` | 5.3 | schedule namespace |
-| `apps/web/src/components/layout/sidebar.tsx` | 5.7 | schedules nav item + Calendar ikon |
-| `apps/web/src/app/[locale]/reports/[id]/page.tsx` | 5.8 | "Zamanla" butonu |
-| `docker/docker-compose.yml` | 6.1 | api + worker servisleri eklendi |
-| `package.json` (root) | 10.1 | docker:dev, worker:dev, worker:build script'leri |
-| `.env.example` | 6.5 | Redis + SMTP degiskenleri |
+# Web
+pnpm --filter=web test
+```
 
----
-
-## Potansiyel Riskler & Builder Notlari
-
-1. **`@nestjs/bullmq` vs `@nestjs/bull`:** Plan `@nestjs/bullmq` kullanir. `@nestjs/bull` BullMQ v5 ile tam uyumlu degildir. `InjectQueue` ve `getQueueToken` `@nestjs/bullmq`'dan import edilir. Processor `WorkerHost`'u extend eder, `@Process()` dekoratörü kullanilmaz.
-
-2. **`cron-parser` versiyonu:** `cron-parser@4.x` CommonJS'dir, `NodeNext` module resolution ile uyumludur. `5.x` ESM oldugu için `4.x` tercih edilmelidir.
-
-3. **Worker bağlantisi mimari notu:** Worker ayri bir process oldugu için API'nin in-memory store'una erisemez. Faz 6 çözümü: Worker `INTERNAL_API_URL` üzerinden HTTP ile `/reports/:id/run` çagririr. Bu geçici bir çözümdür — Prisma entegrasyonunda kalicilasir.
-
-4. **`tr.json` dosyasi:** Builder önce dosyanin varlığını kontrol etmeli. Yoksa olusturur, varsa schedule namespace'ini ekler.
-
-5. **Handlebars `HandlebarsTemplateDelegate` tipi:** `@types/handlebars` paketi gerekmez — `handlebars` paketin kendi tip tanımlamalari var (`handlebars/types`). Builder tip hatasinda paketi `@types/handlebars` yerine `handlebars` üzerinden çözmelidir.
-
-6. **Docker Buildx:** CI/CD pipeline'ında `docker/setup-buildx-action` gereklidir. Multi-platform build istenirse `platforms: linux/amd64,linux/arm64` eklenebilir.
-
-7. **`exactOptionalPropertyTypes: true`:** `tsconfig.base.json`'da aktif. `ScheduleDefinition`'daki `lastRunAt?: Date` ve `nextRunAt?: Date` alanlari `undefined` olarak atanirken dikkatli olunmali — `patch.lastRunAt = undefined` yerine `delete patch.lastRunAt` kullanilmasi gerekebilir.
-
----
-
-## Kabul Kriterleri (Reviewer Icin)
-
-- [ ] `POST /schedules` geçersiz cron expression için `400 Bad Request` döndürür
-- [ ] `POST /schedules/:id/trigger` BullMQ kuyruğuna is ekler ve `{ jobId }` döndürür
-- [ ] `@Cron('* * * * *')` her dakika çalisir ve süresi geçmis schedule'lari kuyruga gönderir
-- [ ] Worker basarisiz job'lari 3 kez exponential backoff ile dener (`attempts: 3, backoff: exponential`)
-- [ ] `RunReportJobSchema` geçersiz payload'i reddeder
-- [ ] Worker SMTP yapilandirilmissa job tamamlandiginda e-posta gönderir
-- [ ] `/schedules` sayfasi schedule'lari listeler ve toggle enable/disable çalisir
-- [ ] "Zamanla" butonu rapor ID'si pre-fill edilmis dialog açar
-- [ ] CI pipeline lint + type-check + test adimlarini sirasıyla çalistirir
-- [ ] Docker build non-root `node` kullanicisıyla çalisir
-- [ ] `GET /health` endpoint'i `{ status: "ok" }` döndürür
-- [ ] `any` tipi yok, `console.log` yok
-- [ ] `ScheduleDefinition` sadece in-memory repository'de tutulur (Prisma migration sonraya birakıldi)
-
----
-
-*Bu plan builder tarafından bagimsiz olarak uygulanabilir. Herhangi bir adimda belirsizlik varsa builder CLAUDE.md'deki "Soru/Onay Gerektiren Durumlar" bölümünü takip etmelidir.*
+Her birinde `Statements: >= 80%` görülmeli. Eksikse tester agent ek case ekler.

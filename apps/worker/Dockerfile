@@ -46,6 +46,13 @@ COPY --from=builder --chown=node:nodejs /app/packages ./packages
 COPY --from=builder --chown=node:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=node:nodejs /app/package.json ./
 COPY --from=builder --chown=node:nodejs /app/pnpm-workspace.yaml ./
+COPY --from=builder --chown=node:nodejs /app/pnpm-lock.yaml ./
+
+# Remove devDependencies to shrink image
+RUN pnpm prune --prod --no-optional && \
+    rm -rf /root/.cache /root/.local /tmp/*
 
 USER node
+HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
+  CMD pgrep -f "node apps/worker/dist/main" || exit 1
 CMD ["node", "apps/worker/dist/main"]

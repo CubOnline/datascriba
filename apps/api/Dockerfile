@@ -49,7 +49,14 @@ COPY --from=builder --chown=node:nodejs /app/packages ./packages
 COPY --from=builder --chown=node:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=node:nodejs /app/package.json ./
 COPY --from=builder --chown=node:nodejs /app/pnpm-workspace.yaml ./
+COPY --from=builder --chown=node:nodejs /app/pnpm-lock.yaml ./
+
+# Remove devDependencies to shrink image
+RUN pnpm prune --prod --no-optional && \
+    rm -rf /root/.cache /root/.local /tmp/*
 
 USER node
 EXPOSE 3001
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+  CMD wget -qO- http://localhost:3001/health || exit 1
 CMD ["node", "apps/api/dist/main"]

@@ -1,184 +1,169 @@
-# REVIEW.md — Phase 6: Scheduler & Dağıtım
+# REVIEW.md — Phase 8: Test, Doküman & Deploy
 
 **Reviewer:** code-review agent
-**Date:** 2026-05-15
+**Date:** 2026-05-16
 **Status:** APPROVED_WITH_FIXES
 
 ---
 
 ## Kritik Sorunlar (C-*)
 
-### C-1 — SMTP Hatası Job'ı Öldürüyordu [DÜZELTILDI]
-
-**Dosya:** `apps/worker/src/processors/run-report.processor.ts`
-
-**Sorun:** `emailService.sendReportEmail()` doğrudan `await` ediliyordu, herhangi bir try/catch olmaksızın. SMTP sunucusu yanıt vermezse veya kimlik doğrulama başarısız olursa, hata BullMQ'ya yayılır; bu da başarıyla oluşturulan raporu "failed" olarak işaretler ve işi 3 kez yeniden dener (`attempts: 3`, `backoff: exponential`). Her yeniden denemede rapor yeniden üretilir ve potansiyel olarak birden fazla e-posta gönderilir.
-
-**Düzeltme:** E-posta bloğu `try/catch` içine alındı. SMTP hatası `logger.error` ile loglanır fakat iş başarılı sayılmaya devam eder. Bu CLAUDE.md'deki "Hata yutma yasak — log ve re-throw" kuralıyla da uyumludur: hata loglanır, job'a re-throw yapılmaz çünkü e-posta ikincil bir bildirimdir, işin kendisi değildir.
-
-**Referans:** CLAUDE.md — "E-posta servisi hata durumunu doğru handle ediyor mu? (SMTP hatası rapor işlemini durdurmamalı)"
-
----
-
-### C-2 — Redis Production'da Unauthenticated Çalışıyordu [DÜZELTILDI]
-
-**Dosya:** `docker/docker-compose.yml`
-
-**Sorun:** Redis servisi `requirepass` olmadan başlatılıyordu. Aynı Docker ağındaki herhangi bir konteyner ya da ağa erişim sağlayan biri, BullMQ kuyruğunu okuyabilir, değiştirebilir veya silebilirdi. Job payload'ları `reportId`, `notifyEmail` ve `parameters` gibi hassas veriler içermektedir.
-
-**Düzeltme:** Redis servisi, `REDIS_PASSWORD` env değişkeni tanımlıysa `--requirepass` argümanıyla başlayacak şekilde güncellendi. Healthcheck de şifreli `redis-cli` ping kullanacak şekilde güncellendi. `.env` dosyası zaten `.gitignore`'da bulunmaktadır. Yerel geliştirme için boş şifre (eski davranış) korunmaktadır; production ortamında `REDIS_PASSWORD` mutlaka ayarlanmalıdır.
+Kritik sorun bulunamadı.
 
 ---
 
 ## Uyarılar (W-*)
 
-### W-1 — CI'da ENCRYPTION_MASTER_KEY Hardcode Test Değeri
+### W-1 — CI/CD: Tag trigger pattern çok geniş (DÜZELTİLDİ)
 
-**Dosya:** `.github/workflows/ci.yml` satır 61
+**Dosya:** `.github/workflows/deploy.yml`
 
-**Değer:** `0000000000000000000000000000000000000000000000000000000000000000`
+`on.push.tags` filtresi `v*` idi; bu pattern `v-beta`, `vtest`, `v` gibi
+istenmeyen tag'lerde de deploy tetikleyebilirdi.
 
-**Durum:** Bu değer yalnızca test ortamı içindir ve gerçek veri şifrelemez. Yine de bu tür değerlerin `${{ secrets.ENCRYPTION_MASTER_KEY_TEST }}` gibi bir GitHub Actions secret'ı aracılığıyla sağlanması tercih edilir. Şu anki haliyle düşük risk, orta seviye kod kalitesi sorunu.
-
-**Öneri:** `ENCRYPTION_MASTER_KEY` için bir GitHub repo secret oluşturun ve CI workflow'da `${{ secrets.ENCRYPTION_MASTER_KEY }}` kullanın.
+**Düzeltme:** `v*` → `v*.*.*` (semver-only trigger).
 
 ---
 
-### W-2 — Postgres Şifresi Hardcode (docker-compose)
+### W-2 — Güvenlik: `.env.example` ANTHROPIC_API_KEY placeholder değeri
 
-**Dosya:** `docker/docker-compose.yml` satır 9-11
+**Dosya:** `.env.example` satır 48
 
-```yaml
-POSTGRES_USER: datascriba
-POSTGRES_PASSWORD: datascriba
-POSTGRES_DB: datascriba
+```
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-**Durum:** Compose dosyasındaki bu değerler yerel geliştirme için kabul edilebilir. `.env` gitignore'da bulunduğundan secret sızması riski yoktur. Ancak production için `POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}` şeklinde env var referansı kullanılarak `.env` dosyasından okunması önerilir.
+`sk-ant-` Anthropic API key prefix'iyle aynı. Placeholder olduğu `...` ile
+belirtilmiş, gerçek credential içermiyor ve güvenlik açığı oluşturmuyor; ancak
+bazı secret-scanner araçları (truffleHog, gitleaks) bu pattern'i false-positive
+olarak işaretleyebilir. `YOUR_ANTHROPIC_API_KEY` gibi açık bir placeholder
+tercih edilebilir.
+
+**Aksiyon alınmadı** — functional risk yok, builder takdiri.
 
 ---
 
-### W-3 — SSRF Kısmi Koruma (INTERNAL_API_URL)
+### W-3 — Dokümantasyon: api.md PATCH vs PUT tutarsızlığı (DÜZELTİLDİ)
 
-**Dosya:** `apps/worker/src/services/report-runner.service.ts` satır 56, `apps/worker/src/config/worker-env.ts` satır 9
+**Dosya:** `docs/api.md`
 
-**Durum:** `INTERNAL_API_URL`, `z.string().url()` ile Zod tarafından doğrulanmaktadır — bu, rastgele URL şemalarını engeller. `reportId` alanı Zod şemasında `z.string().uuid()` ile validate edilmektedir, bu da path traversal'ı (`../../../etc/passwd` gibi) engeller. Mevcut koruma yeterli olmakla birlikte, gelecekte `INTERNAL_API_URL`'nin allowlist'e alınması (sadece `http://api:` önekini kabul etmek gibi) daha sağlam bir yaklaşım olacaktır.
+Üç update endpoint (`/data-sources/:id`, `/reports/:id`, `/schedules/:id`)
+`PATCH` olarak belgelenmişti; ancak controller'ların tümü `@Put` dekoratörü
+kullanıyor ve e2e testler `.put()` ile çağırıyor.
 
----
-
-### W-4 — Multi-Pod Race Condition (Gelecek Faz)
-
-**Dosya:** `apps/api/src/modules/schedule/schedule.service.ts` satır 112-145
-
-**Durum:** Birden fazla API pod'u çalışırsa `@Cron('* * * * *')` her pod'da tetiklenir ve aynı schedule birden fazla job'a dönüşebilir. Şu anki in-memory store fazında tek bir process çalıştığından bu sorun değildir. Prisma entegrasyonu yapıldığında (sonraki faz) atomic `UPDATE ... WHERE nextRunAt <= NOW() AND processing = FALSE` ya da BullMQ'nun `jobId` deduplication özelliği kullanılmalıdır.
+**Düzeltme:** Tüm üç `PATCH` başlığı `PUT` olarak güncellendi.
 
 ---
 
 ## Öneriler (S-*)
 
-### S-1 — Cron Validation Güçlendirilebilir
+### S-1 — schedule.e2e-spec.ts: BullMQ gerçek adres içeriyor
 
-**Dosya:** `apps/api/src/modules/schedule/dto/create-schedule.dto.ts`
+**Dosya:** `apps/api/src/modules/schedule/schedule.e2e-spec.ts` satır 75-78
 
-**Durum:** `cronExpression` doğrulaması `@MinLength(9)` + `cron-parser` parse başarısına dayanmaktadır. Bu yeterlidir çünkü `cron-parser` geçersiz ifadeleri reddeder. Injection riski de yoktur — cron ifadesi SQL sorgusuna veya shell komutuna gömülmemektedir, yalnızca `parseExpression()` ve in-memory scheduler'a geçilmektedir.
+```typescript
+BullModule.forRoot({
+  connection: { host: '127.0.0.1', port: 6379, maxRetriesPerRequest: 0, enableReadyCheck: false },
+}),
+```
 
-**İyileştirme:** Custom class-validator decorator ile whitelist (`[0-9*,/\- ]` karakterleri) eklenebilir. Bu, kütüphane güvenlik açığı durumunda ek bir savunma katmanı sağlar.
+Queue provider `overrideProvider(getQueueToken(QUEUE_NAME)).useValue(queueMock)`
+ile override edildiğinden gerçek bağlantı kurulmaz. `maxRetriesPerRequest: 0`
+ve `enableReadyCheck: false` iyi bir pratik; ancak bu yaklaşım BullMQ
+kütüphanesi güncellendikçe kırılabilir. Uzun vadede BullMQ bağımlılığını
+tamamen dışarıda bırakarak minimum test modülü oluşturmak daha dayanıklı olur.
 
----
+### S-2 — ai.e2e-spec.ts: SSE endpoint assertion'ları geniş
 
-### S-2 — E-posta Header Injection — Yeterince Mitigate Edilmiş (Olumlu)
+**Dosya:** `apps/api/src/modules/ai/ai.e2e-spec.ts` satır 121, 137
 
-**Durum:** `notifyEmail` alanı hem API DTO'sunda (`@IsEmail()`) hem de Zod şemasında (`z.string().email()`) ve frontend formunda (Zod resolver + `type="email"`) doğrulanmaktadır. Nodemailer `\r\n` içeren adresleri zaten reddeder. Katmanlı koruma yeterlidir.
+```typescript
+expect([200, 400, 422]).toContain(res.status)
+```
 
----
+SSE endpoint'leri için status kodu aralığı çok geniş. AiService mock tamamen
+override edildiğinden 200 garantilenebilir; `expect(res.status).toBe(200)` ile
+değiştirilebilir. Mevcut haliyle yanlış pozitif risk yok fakat assertion gücü
+düşük.
 
-### S-3 — deploy.yml Image Tag Commit SHA Kullanıyor (Olumlu)
+### S-3 — vitest.config.ts: Ayrı e2e config yokluğu
 
-**Dosya:** `.github/workflows/deploy.yml`
+**Dosya:** `apps/api/vitest.config.ts`
 
-`docker/metadata-action` ile `type=sha,prefix=sha-` tag'i oluşturulmaktadır. Her deployment'ın tam olarak hangi commit'ten inşa edildiği izlenebilirdir. Güvenlik açısından olumlu.
+Hem unit (`*.spec.ts`) hem e2e (`*.e2e-spec.ts`) aynı konfigürasyonla çalışıyor.
+E2e testler için `testTimeout` konfigürasyonu 15 s olarak ayarlanmış; bu yeterli
+olsa da, büyüdükçe e2e'ye ayrı config (`vitest.config.e2e.ts`) + ayrı `test:e2e`
+script oluşturmak CI sürelerini ve hata izolasyonunu iyileştirir.
 
----
+### S-4 — docker-compose.prod.yml: Top-level `volumes` tanımı eksik
 
-### S-4 — Dockerfile Non-Root USER node (Olumlu)
+**Dosya:** `docker/docker-compose.prod.yml`
 
-**Dosya:** `apps/api/Dockerfile`, `apps/worker/Dockerfile`
-
-Her iki Dockerfile'da da production stage'inde `USER node` direktifi bulunmaktadır. Container privilege escalation riski minimize edilmiştir.
-
----
-
-### S-5 — BullMQ Job Payload Runtime Zod Validation (Olumlu)
-
-**Dosya:** `apps/worker/src/processors/run-report.processor.ts`, `packages/queue-config/src/run-report-job.schema.ts`
-
-`RunReportJobSchema.safeParse(job.data)` ile runtime doğrulama yapılmaktadır. Malformed payload'lar tutarlı bir hata mesajıyla reddedilmektedir. TypeScript `any` tipi yerine `Job<unknown>` kullanılmıştır. CLAUDE.md standardıyla uyumludur.
-
----
-
-### S-6 — `@Cron` Decorator Doğru Kullanımı (Olumlu)
-
-**Dosya:** `apps/api/src/modules/schedule/schedule.service.ts` satır 112
-
-`@Cron('* * * * *')` ile dakika bazlı dispatcher doğru yapılandırılmıştır. `NestScheduleModule.forRoot()` `app.module.ts`'de kayıtlıdır. Hata yönetimi her schedule için try/catch ile sarılmıştır — bir schedule'ın başarısız olması diğerlerini etkilemez.
-
----
-
-### S-7 — `any` Tipi Kullanımı Yok (Olumlu)
-
-Tüm incelenen dosyalarda `any` tipi tespit edilmemiştir. CLAUDE.md standardıyla uyumludur.
+`worker` servisinde `report_output` named volume kullanılıyor ancak bu dosyada
+top-level `volumes:` bildirimi yok. Base `docker-compose.yml` dosyasında bu
+volume tanımlıysa sorun yok; yoksa compose başlatma sırasında hata alınır.
+Prod override'ın bağımsız okunabilirliği için kısaca belgelenmesi önerilir.
 
 ---
 
-### S-8 — `console.log` Yok (Olumlu)
+## Test Kalitesi Özeti
 
-Tüm incelenen `.ts` dosyalarında `console.log` kullanımı tespit edilmemiştir. NestJS `Logger` servisi kullanılmaktadır. `worker-env.ts`'deki `process.stderr.write()` kullanımı kabul edilebilirdir — bu bir Logger bağımlılığı olmaksızın erken startup hata raporlamasıdır. CLAUDE.md standardıyla uyumludur.
-
----
-
-### S-9 — CI Redis Service Konfigürasyonu Yeterli (Olumlu)
-
-**Dosya:** `.github/workflows/ci.yml` satır 47-56
-
-Redis 7 Alpine image kullanılmakta, health check tanımlı ve port doğru eşleştirilmiştir. `REDIS_HOST: 127.0.0.1` ile servis erişimi doğrudur.
-
----
-
-### S-10 — Secret Sızması Riski Yok (Olumlu)
-
-- SMTP şifresi (`SMTP_PASS`) loglanmıyor.
-- Redis şifresi (`REDIS_PASSWORD`) loglanmıyor.
-- Queue connection config'i log'a düşmüyor.
-- `ENCRYPTION_MASTER_KEY` loglanmıyor.
-- `.env` dosyası `.gitignore`'da bulunuyor.
-- deploy.yml'de yalnızca `${{ secrets.GITHUB_TOKEN }}` kullanılıyor, hardcode secret yok.
+| Dosya | Dış Servis | console.log | Mock Doğruluğu | Assertion Gücü | beforeEach Reset | Bağımsız Test |
+|---|---|---|---|---|---|---|
+| data-source.e2e-spec.ts | Hayır (mock) | Yok | Doğru | Güçlü | Var | Evet |
+| report.e2e-spec.ts | Hayır (mock) | Yok | Doğru | Güçlü | Var | Evet |
+| schedule.e2e-spec.ts | BullMQ addr (override'd) | Yok | Doğru | Güçlü | Var | Evet |
+| ai.e2e-spec.ts | Hayır (mock) | Yok | Doğru | Orta (bkz. S-2) | N/A (beforeAll) | Evet |
+| use-ai.test.ts | Hayır (fetch stub) | Yok | Doğru | Güçlü | Var (afterEach restore) | Evet |
+| ai-assistant-panel.test.tsx | Hayır (mock) | Yok | Doğru | Güçlü | Var (clearAllMocks) | Evet |
 
 ---
 
-## Düzeltilen Dosyalar
+## CI/CD Özeti
 
-| Dosya | Değişiklik |
-|-------|-----------|
-| `apps/worker/src/processors/run-report.processor.ts` | Email bloğu try/catch ile sarıldı (C-1) |
-| `docker/docker-compose.yml` | Redis `REDIS_PASSWORD` env var ile auth desteği eklendi (C-2) |
+| Kontrol | Sonuç |
+|---|---|
+| Tag trigger format | Düzeltildi (`v*.*.*`) |
+| Secrets hardcode | Yok — tümü `${{ secrets.X }}` |
+| Docker build target | `production` olarak ayarlı |
+| Cache stratejisi | `type=gha` — doğru |
+| Release prerelease detection | `contains(version, '-')` — doğru |
 
-## Type-Check Sonuçları
+---
 
-| Paket | Komut | Sonuç |
-|-------|-------|-------|
-| API | `pnpm --filter=api type-check` | PASS — hata yok |
-| Worker | `pnpm --filter=worker type-check` | PASS — hata yok |
-| Web | `pnpm --filter=web type-check` | PASS — hata yok |
+## Dokümantasyon Özeti
+
+| Dosya | Durum |
+|---|---|
+| README.md | Quickstart komutları gerçek, placeholder yok |
+| docs/api.md | PATCH→PUT düzeltildi (W-3), içerik eksiksiz |
+| docs/architecture.md | Mermaid diyagramları doğru sözdizimi |
+| docs/deployment.md | Tüm env var'lar listeli, üretim checklist var |
+| CONTRIBUTING.md | Agent workflow açıklanmış, PR kuralları eksiksiz |
+| docs/adr/001-mssql-only.md | Karar + gerekçe + sonuç formatında |
+| docs/adr/002-in-memory-repo.md | Karar + gerekçe + migration planı var |
+| docs/adr/003-csv-excel-only.md | Karar + gerekçe + gelecek planı var |
+
+---
+
+## Test Çalışma Sonuçları
+
+```
+vitest run (apps/api):   9 test dosyası, 79 test — TÜMÜ GEÇTI
+pnpm --filter=api type-check:   HATA YOK
+pnpm --filter=web type-check:   HATA YOK
+```
 
 ---
 
 ## Özet
 
-Faz 6 implementasyonu genel olarak güçlü bir güvenlik ve kalite temeline sahiptir. Cron injection, e-posta header injection ve path traversal için mevcut savunmalar yeterlidir. BullMQ Zod runtime validation, non-root Docker user, structured logging ve `any` yasağına uyum olumlu bulgular arasındadır.
+Faz 8 implementasyonu genel olarak yüksek kaliteli. Tüm testler in-memory mock
+kullanıyor; dış servis (DB, Redis, SMTP, Anthropic) bağlantısı gerektirmiyor.
+Mock'lar doğru kurulmuş, `beforeEach` store reset'leri var, testler birbirinden
+bağımsız. `console.log` yok, gerçek credential yok, anlamsız assertion yok.
 
-**2 kritik sorun tespit edildi ve düzeltildi:**
+İki düzeltme yapıldı: CI/CD tag pattern daraltıldı (`v*` → `v*.*.*`) ve api.md
+PATCH/PUT tutarsızlığı giderildi. Dört öneri verildi; hiçbiri engelleyici değil.
 
-1. **C-1:** SMTP hatasının BullMQ job retry döngüsüne yol açması — gereksiz rapor yeniden üretimi ve potansiyel duplicate email riski ortadan kaldırıldı.
-2. **C-2:** Production Redis'in unauthenticated çalışması — `REDIS_PASSWORD` env var ile opsiyonel auth desteği eklendi.
-
-Tüm type-check'ler sorunsuz geçmektedir. Tester fazına ilerlenebilir; yalnızca W-4 (multi-pod race condition) Prisma entegrasyonu öncesinde takibe alınmalıdır.
+Faz 8, **APPROVED_WITH_FIXES** statüsüyle onaylanmıştır.

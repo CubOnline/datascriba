@@ -93,3 +93,49 @@ jobs:
           name: coverage
           path: '**/coverage/**'
           retention-days: 7
+
+  integration-tests:
+    name: Integration Tests (E2E)
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      ENCRYPTION_MASTER_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      ANTHROPIC_API_KEY: test-key
+      AI_MODEL: claude-sonnet-4-6
+      AI_RATE_LIMIT_RPM: 100
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: |
+          pnpm --filter=@datascriba/tsconfig build || true
+          pnpm --filter=@datascriba/shared-types build || true
+          pnpm --filter=@datascriba/queue-config build || true
+          pnpm --filter=@datascriba/db-drivers build || true
+          pnpm --filter=@datascriba/report-engine build || true
+          pnpm --filter=@datascriba/ai-client build || true
+
+      - name: Run API integration tests
+        run: pnpm --filter=api test:e2e
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-coverage
+          path: 'apps/api/coverage/**'
+          retention-days: 7
