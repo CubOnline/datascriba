@@ -7,8 +7,6 @@ import { ScheduleModule as NestScheduleModule } from '@nestjs/schedule'
 import { ThrottlerModule } from '@nestjs/throttler'
 // Note: @nestjs/bullmq exports BullModule (wraps BullMQ v5)
 
-import { AppController } from './app.controller'
-import { AppService } from './app.service'
 import { AppExceptionFilter } from './common/filters/app-exception.filter'
 import type { Env } from './config/env'
 import { HealthController } from './health/health.controller'
@@ -21,7 +19,7 @@ import { ScheduleModule } from './modules/schedule/schedule.module'
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: ['.env.local', '.env'],
+      envFilePath: ['.env.local', '.env', '../../.env.local', '../../.env'],
     }),
     ThrottlerModule.forRootAsync({
       inject: [ConfigService],
@@ -48,9 +46,8 @@ import { ScheduleModule } from './modules/schedule/schedule.module'
     AiModule,
     ScheduleModule,
   ],
-  controllers: [AppController, HealthController],
+  controllers: [HealthController],
   providers: [
-    AppService,
     {
       provide: APP_FILTER,
       useClass: AppExceptionFilter,

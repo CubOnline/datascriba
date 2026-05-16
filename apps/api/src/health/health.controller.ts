@@ -4,6 +4,7 @@ import { ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger'
 interface HealthResponse {
   status: 'ok'
   timestamp: string
+  version: string
 }
 
 @ApiTags('Health')
@@ -14,6 +15,6 @@ export class HealthController {
   @ApiOperation({ summary: 'API health check' })
   @ApiOkResponse({ description: 'Service is healthy' })
   check(): HealthResponse {
-    return { status: 'ok', timestamp: new Date().toISOString() }
+    return { status: 'ok', timestamp: new Date().toISOString(), version: '0.1.0' }
   }
 }

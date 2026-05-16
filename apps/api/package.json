@@ -23,6 +23,7 @@
     "@datascriba/queue-config": "workspace:*",
     "@datascriba/report-engine": "workspace:*",
     "@datascriba/shared-types": "workspace:*",
+    "@fastify/static": "^7.0.4",
     "@nestjs/bullmq": "^10.2.3",
     "@nestjs/common": "^10.4.15",
     "@nestjs/config": "^3.3.0",
