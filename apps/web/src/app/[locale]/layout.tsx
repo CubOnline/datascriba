@@ -29,7 +29,7 @@ export default async function LocaleLayout({ children, params }: LocaleLayoutPro
               <Sidebar />
               <div className="flex flex-1 flex-col overflow-hidden">
                 <Header />
-                <main className="flex-1 overflow-auto p-6">{children}</main>
+                <main className="flex-1 overflow-auto bg-secondary p-6">{children}</main>
               </div>
             </div>
           </Providers>

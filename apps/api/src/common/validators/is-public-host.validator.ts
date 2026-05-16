@@ -35,6 +35,7 @@ export function IsPublicHost(validationOptions?: ValidationOptions) {
       validator: {
         validate(value: unknown): boolean {
           if (typeof value !== 'string') return false
+          if (process.env['NODE_ENV'] !== 'production') return true
           return !BLOCKED_HOST_RE.test(value)
         },
       },

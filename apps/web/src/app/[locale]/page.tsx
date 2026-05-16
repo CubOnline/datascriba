@@ -1,5 +1,5 @@
-import { redirect } from 'next/navigation'
+import { DashboardClient } from './dashboard-client'
 
 export default function HomePage() {
-  redirect('/reports')
+  return <DashboardClient />
 }
