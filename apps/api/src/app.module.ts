@@ -10,6 +10,7 @@ import { ThrottlerModule } from '@nestjs/throttler'
 import { AppExceptionFilter } from './common/filters/app-exception.filter'
 import type { Env } from './config/env'
 import { HealthController } from './health/health.controller'
+import { AuthModule } from './modules/auth/auth.module'
 import { AiModule } from './modules/ai/ai.module'
 import { DataSourceModule } from './modules/data-source/data-source.module'
 import { ReportModule } from './modules/report/report.module'
@@ -41,6 +42,7 @@ import { ScheduleModule } from './modules/schedule/schedule.module'
           password: config.get('REDIS_PASSWORD'),
         }),
     }),
+    AuthModule,
     DataSourceModule,
     ReportModule,
     AiModule,

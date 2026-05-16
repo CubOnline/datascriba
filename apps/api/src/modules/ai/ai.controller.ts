@@ -18,6 +18,7 @@ import {
 import { ThrottlerGuard } from '@nestjs/throttler'
 import { Observable, from, map } from 'rxjs'
 
+import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { AiService } from './ai.service'
 import { ExplainQueryDto } from './dto/explain-query.dto'
 import { FixQueryDto } from './dto/fix-query.dto'
@@ -42,13 +43,9 @@ function chunkToSse(
   )
 }
 
-// TODO(security/C-1): Add Better-Auth session guard here once the auth module
-// is implemented. Currently ALL AI endpoints are unauthenticated — any client
-// that can reach the API can consume the Anthropic quota without logging in.
-// Pattern: @UseGuards(SessionGuard, ThrottlerGuard)
 @ApiTags('AI')
 @Controller('ai')
-@UseGuards(ThrottlerGuard)
+@UseGuards(JwtAuthGuard, ThrottlerGuard)
 export class AiController {
   constructor(private readonly service: AiService) {}
 

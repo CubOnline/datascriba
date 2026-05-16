@@ -11,7 +11,9 @@ import {
   Put,
   Res,
   StreamableFile,
+  UseGuards,
 } from '@nestjs/common'
+import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import {
   ApiBody,
   ApiNoContentResponse,
@@ -28,6 +30,7 @@ import { RunReportDto } from './dto/run-report.dto'
 import { ReportService } from './report.service'
 
 @ApiTags('Reports')
+@UseGuards(JwtAuthGuard)
 @Controller('reports')
 export class ReportController {
   constructor(private readonly service: ReportService) {}

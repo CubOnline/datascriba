@@ -9,7 +9,9 @@ import {
   Param,
   Post,
   Put,
+  UseGuards,
 } from '@nestjs/common'
+import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import {
   ApiBody,
   ApiNotFoundResponse,
@@ -26,6 +28,7 @@ import { ExecuteQueryDto } from './dto/execute-query.dto'
 import { UpdateDataSourceDto } from './dto/update-data-source.dto'
 
 @ApiTags('Data Sources')
+@UseGuards(JwtAuthGuard)
 @Controller('data-sources')
 export class DataSourceController {
   constructor(private readonly service: DataSourceService) {}

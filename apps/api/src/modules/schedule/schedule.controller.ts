@@ -9,7 +9,9 @@ import {
   Param,
   Post,
   Put,
+  UseGuards,
 } from '@nestjs/common'
+import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import {
   ApiBody,
   ApiCreatedResponse,
@@ -26,6 +28,7 @@ import { UpdateScheduleDto } from './dto/update-schedule.dto'
 import { ScheduleService } from './schedule.service'
 
 @ApiTags('Schedules')
+@UseGuards(JwtAuthGuard)
 @Controller('schedules')
 export class ScheduleController {
   constructor(private readonly service: ScheduleService) {}

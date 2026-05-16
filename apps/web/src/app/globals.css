@@ -22,9 +22,27 @@
     --input: 215 28% 91%;
     --ring: 239 84% 67%;
     --radius: 0.625rem;
+
+    /* Neutrals */
+    --neutral-cream: 60 60% 98%;
+    --neutral-50: 210 40% 98%;
+    --neutral-200: 215 28% 91%;
+    --neutral-500: 215 16% 47%;
+    --neutral-700: 215 25% 27%;
+    --neutral-900: 222 47% 11%;
+
+    /* Semantic — foreground */
     --success: 160 84% 39%;
     --warning: 38 92% 50%;
+    --error: 0 84% 60%;
     --info: 217 91% 60%;
+
+    /* Semantic — background */
+    --success-bg: 152 80% 96%;
+    --warning-bg: 48 100% 96%;
+    --error-bg: 0 86% 97%;
+    --info-bg: 214 100% 97%;
+
     --ai-accent: 262 83% 66%;
   }
 
@@ -48,6 +66,16 @@
     --border: 215 25% 27%;
     --input: 215 25% 27%;
     --ring: 234 89% 82%;
+
+    /* Dark semantic overrides */
+    --success: 161 69% 52%;
+    --muted-foreground: 215 20% 65%;
+
+    /* Dark semantic backgrounds (darkened) */
+    --success-bg: 161 30% 12%;
+    --warning-bg: 38 40% 12%;
+    --error-bg: 0 40% 12%;
+    --info-bg: 217 40% 12%;
   }
 
   * {
